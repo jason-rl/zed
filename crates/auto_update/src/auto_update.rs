@@ -47,6 +47,8 @@ impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+const FORK_RELEASE_API_URL: &str = "https://api.github.com/repos/jason-rl/zed/releases/latest";
+const FORK_RELEASE_ASSET_NAME: &str = "Zed-aarch64.dmg";
 
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
@@ -181,12 +183,86 @@ pub struct AutoUpdater {
     quit_subscription: Option<gpui::Subscription>,
     update_check_type: UpdateCheckType,
     dismissed_status: Option<AutoUpdateStatus>,
+    installed_update_commit_sha: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    target_commitish: Option<String>,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug)]
+struct DesktopRelease {
+    asset: ReleaseAsset,
+    commit_sha: Option<String>,
+}
+
+async fn get_desktop_release_asset(
+    http_client: Arc<dyn HttpClient>,
+    os: &str,
+    arch: &str,
+) -> Result<DesktopRelease> {
+    anyhow::ensure!(
+        os == "macos" && arch == "aarch64",
+        "unsupported platform for fork auto-updates: {os}-{arch}"
+    );
+
+    let mut response = http_client
+        .get(FORK_RELEASE_API_URL, Default::default(), true)
+        .await?;
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+
+    anyhow::ensure!(
+        response.status().is_success(),
+        "failed to fetch fork release: HTTP {}: {:?}",
+        response.status(),
+        String::from_utf8_lossy(&body),
+    );
+
+    let release: GitHubRelease = serde_json::from_slice(&body).with_context(|| {
+        format!(
+            "error deserializing fork release {:?}",
+            String::from_utf8_lossy(&body),
+        )
+    })?;
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .context("fork release tag must start with 'v'")?;
+    let version = Version::parse(version).context("fork release tag must contain a semver")?;
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == FORK_RELEASE_ASSET_NAME)
+        .with_context(|| format!("fork release is missing {FORK_RELEASE_ASSET_NAME}"))?;
+
+    let commit_sha = release.target_commitish.and_then(|commitish| {
+        (commitish.len() == 40 && commitish.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| commitish.to_ascii_lowercase())
+    });
+
+    Ok(DesktopRelease {
+        asset: ReleaseAsset {
+            version: version.to_string(),
+            url: asset.browser_download_url,
+        },
+        commit_sha,
+    })
 }
 
 struct MacOsUnmounter<'a> {
@@ -338,23 +414,39 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
 
 pub fn release_notes_url(cx: &mut App) -> Option<String> {
     let release_channel = ReleaseChannel::try_global(cx)?;
-    let url = match release_channel {
+    let current_version = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
             let auto_updater = AutoUpdater::get(cx)?;
             let auto_updater = auto_updater.read(cx);
             let mut current_version = auto_updater.current_version.clone();
             current_version.pre = semver::Prerelease::EMPTY;
             current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+            Some(current_version)
         }
-        ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
-        }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        ReleaseChannel::Nightly | ReleaseChannel::Dev => None,
     };
-    Some(url)
+    Some(fork_release_notes_url(
+        release_channel,
+        current_version.as_ref(),
+    ))
+}
+
+fn fork_release_notes_url(
+    release_channel: ReleaseChannel,
+    current_version: Option<&Version>,
+) -> String {
+    match (release_channel, current_version) {
+        (ReleaseChannel::Stable | ReleaseChannel::Preview, Some(current_version)) => {
+            format!("https://github.com/jason-rl/zed/releases/tag/v{current_version}")
+        }
+        (ReleaseChannel::Nightly, _) => {
+            "https://github.com/jason-rl/zed/commits/nightly/".to_string()
+        }
+        (ReleaseChannel::Dev, _) => "https://github.com/jason-rl/zed/commits/main/".to_string(),
+        (ReleaseChannel::Stable | ReleaseChannel::Preview, None) => {
+            "https://github.com/jason-rl/zed/releases".to_string()
+        }
+    }
 }
 
 pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
@@ -449,6 +541,7 @@ impl AutoUpdater {
             quit_subscription,
             update_check_type: UpdateCheckType::Automatic,
             dismissed_status: None,
+            installed_update_commit_sha: None,
         }
     }
 
@@ -703,15 +796,21 @@ impl AutoUpdater {
     }
 
     async fn update(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
-        let (client, installed_version, previous_status, release_channel) =
-            this.read_with(cx, |this, cx| {
-                (
-                    this.client.http_client(),
-                    this.current_version.clone(),
-                    this.status.clone(),
-                    ReleaseChannel::try_global(cx).unwrap_or(ReleaseChannel::Stable),
-                )
-            });
+        let (
+            client,
+            installed_version,
+            installed_update_commit_sha,
+            previous_status,
+            release_channel,
+        ) = this.read_with(cx, |this, cx| {
+            (
+                this.client.http_client(),
+                this.current_version.clone(),
+                this.installed_update_commit_sha.clone(),
+                this.status.clone(),
+                ReleaseChannel::try_global(cx).unwrap_or(ReleaseChannel::Stable),
+            )
+        });
 
         Self::check_dependencies()?;
 
@@ -721,17 +820,25 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
-        let fetched_version = fetched_release_data.clone().version;
-        let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
-        let newer_version = Self::check_if_fetched_version_is_newer(
-            release_channel,
-            app_commit_sha,
-            installed_version,
-            fetched_version,
-            previous_status.clone(),
-        )?;
+        let fetched_release = get_desktop_release_asset(client.clone(), OS, ARCH).await?;
+        let fetched_version = fetched_release.asset.version.parse::<Version>()?;
+        let app_commit_sha = cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full()));
+        let newer_version = match release_channel {
+            ReleaseChannel::Nightly => Self::check_if_fetched_version_is_newer(
+                release_channel,
+                Ok(app_commit_sha),
+                installed_version,
+                fetched_version.to_string(),
+                previous_status.clone(),
+            )?,
+            _ => Self::check_if_fetched_desktop_release_is_newer(
+                installed_version,
+                app_commit_sha.as_deref(),
+                installed_update_commit_sha.as_deref(),
+                fetched_version,
+                fetched_release.commit_sha.as_deref(),
+            ),
+        };
 
         let Some(newer_version) = newer_version else {
             this.update(cx, |this, cx| {
@@ -761,7 +868,7 @@ impl AutoUpdater {
         let mut progress_cx = cx.clone();
         download_release(
             &target_path,
-            fetched_release_data,
+            fetched_release.asset,
             client,
             move |progress| {
                 progress_entity.update(&mut progress_cx, |this, cx| {
@@ -816,6 +923,7 @@ impl AutoUpdater {
         }
 
         this.update(cx, |this, cx| {
+            this.installed_update_commit_sha = fetched_release.commit_sha;
             this.set_should_show_update_notification(true, cx)
                 .detach_and_log_err(cx);
             this.status = AutoUpdateStatus::Updated {
@@ -860,6 +968,30 @@ impl AutoUpdater {
                 ))
             }
         }
+    }
+
+    fn check_if_fetched_desktop_release_is_newer(
+        mut installed_version: Version,
+        installed_commit_sha: Option<&str>,
+        installed_update_commit_sha: Option<&str>,
+        fetched_version: Version,
+        fetched_commit_sha: Option<&str>,
+    ) -> Option<Version> {
+        installed_version.pre = semver::Prerelease::EMPTY;
+        installed_version.build = semver::BuildMetadata::EMPTY;
+
+        if fetched_version > installed_version {
+            return Some(fetched_version);
+        }
+        if fetched_version < installed_version {
+            return None;
+        }
+
+        let installed_commit_sha = installed_commit_sha?;
+        let fetched_commit_sha = fetched_commit_sha?;
+        (fetched_commit_sha != installed_commit_sha
+            && Some(fetched_commit_sha) != installed_update_commit_sha)
+            .then_some(fetched_version)
     }
 
     fn check_dependencies() -> Result<()> {
@@ -1360,7 +1492,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_auto_update_downloads(cx: &mut TestAppContext) {
+    async fn test_auto_update_downloads_same_version_from_new_commit_once(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
         zlog::init_test();
         let release_available = Arc::new(AtomicBool::new(false));
@@ -1372,6 +1504,10 @@ mod tests {
 
             let current_version = semver::Version::new(0, 100, 0);
             release_channel::init_test(current_version, ReleaseChannel::Stable, cx);
+            AppCommitSha::set_global(
+                AppCommitSha::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                cx,
+            );
 
             let clock = Arc::new(FakeSystemClock::new());
             let release_available = Arc::clone(&release_available);
@@ -1380,14 +1516,16 @@ mod tests {
                 let release_available = release_available.load(atomic::Ordering::Relaxed);
                 let dmg_rx = dmg_rx.clone();
                 async move {
-                if req.uri().path() == "/releases/stable/latest/asset" {
+                if req.uri().to_string()
+                    == "https://api.github.com/repos/jason-rl/zed/releases/latest"
+                {
                     if release_available {
                         return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.1","url":"https://test.example/new-download"}"#.into()
+                            r#"{"tag_name":"v0.100.0","target_commitish":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","assets":[{"name":"Zed-aarch64.dmg","browser_download_url":"https://test.example/new-download"}]}"#.into()
                         ).unwrap());
                     } else {
                         return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.0","url":"https://test.example/old-download"}"#.into()
+                            r#"{"tag_name":"v0.100.0","target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"name":"Zed-aarch64.dmg","browser_download_url":"https://test.example/old-download"}]}"#.into()
                         ).unwrap());
                     }
                 } else if req.uri().path() == "/new-download" {
@@ -1428,7 +1566,7 @@ mod tests {
         assert_eq!(
             status,
             AutoUpdateStatus::Downloading {
-                version: semver::Version::new(0, 100, 1),
+                version: semver::Version::new(0, 100, 0),
                 progress: None,
             }
         );
@@ -1459,14 +1597,132 @@ mod tests {
         assert_eq!(
             status,
             AutoUpdateStatus::Updated {
-                version: semver::Version::new(0, 100, 1)
+                version: semver::Version::new(0, 100, 0)
             }
         );
+
+        cx.background_executor.advance_clock(POLL_INTERVAL);
+        cx.background_executor.run_until_parked();
+        assert_eq!(
+            auto_updater.read_with(cx, |updater, _| updater.status()),
+            AutoUpdateStatus::Updated {
+                version: semver::Version::new(0, 100, 0)
+            }
+        );
+
         let will_restart = cx.expect_restart();
         cx.update(|cx| cx.restart());
         let path = will_restart.await.unwrap().unwrap();
         assert_eq!(path, tmp_dir.path().join("zed"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "<fake-zed-update>");
+    }
+
+    #[gpui::test]
+    async fn test_get_desktop_release_asset_from_fork() {
+        let client = FakeHttpClient::create(|request| async move {
+            assert_eq!(
+                request.uri().to_string(),
+                "https://api.github.com/repos/jason-rl/zed/releases/latest"
+            );
+            Ok(Response::builder()
+                .status(200)
+                .body(
+                    r#"{"tag_name":"v1.2.3","target_commitish":"0123456789abcdef0123456789abcdef01234567","assets":[{"name":"other.zip","browser_download_url":"https://example.com/other.zip"},{"name":"Zed-aarch64.dmg","browser_download_url":"https://example.com/Zed-aarch64.dmg"}]}"#
+                        .into(),
+                )
+                .expect("valid response"))
+        });
+
+        let release = get_desktop_release_asset(client, "macos", "aarch64")
+            .await
+            .expect("fork release should parse");
+        assert_eq!(release.asset.version, "1.2.3");
+        assert_eq!(release.asset.url, "https://example.com/Zed-aarch64.dmg");
+        assert_eq!(
+            release.commit_sha.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_get_desktop_release_asset_ignores_invalid_commitish() {
+        let client = FakeHttpClient::create(|_request| async move {
+            Ok(Response::builder()
+                .status(200)
+                .body(
+                    r#"{"tag_name":"v1.2.3","target_commitish":"main","assets":[{"name":"Zed-aarch64.dmg","browser_download_url":"https://example.com/Zed-aarch64.dmg"}]}"#
+                        .into(),
+                )
+                .expect("valid response"))
+        });
+
+        let release = get_desktop_release_asset(client, "macos", "aarch64")
+            .await
+            .expect("fork release should parse");
+        assert_eq!(release.commit_sha, None);
+    }
+
+    #[gpui::test]
+    async fn test_get_desktop_release_asset_reports_invalid_releases() {
+        let cases = [
+            (200, r#"{"tag_name":"1.2.3","assets":[]}"#, "tag"),
+            (
+                200,
+                r#"{"tag_name":"v1.2.3","assets":[]}"#,
+                "Zed-aarch64.dmg",
+            ),
+            (200, r#"not json"#, "deserializing"),
+            (503, r#"unavailable"#, "failed to fetch"),
+        ];
+
+        for (status, body, expected_error) in cases {
+            let body = body.to_string();
+            let client = FakeHttpClient::create(move |_request| {
+                let body = body.clone();
+                async move {
+                    Ok(Response::builder()
+                        .status(status)
+                        .body(body.into())
+                        .expect("valid response"))
+                }
+            });
+            let error = get_desktop_release_asset(client, "macos", "aarch64")
+                .await
+                .expect_err("invalid release should fail");
+            assert!(
+                error.to_string().contains(expected_error),
+                "expected {error:?} to contain {expected_error:?}"
+            );
+        }
+
+        let client = FakeHttpClient::create(|_request| async move {
+            panic!("unsupported platforms should not make a request")
+        });
+        let error = get_desktop_release_asset(client, "linux", "x86_64")
+            .await
+            .expect_err("unsupported platform should fail");
+        assert!(error.to_string().contains("unsupported platform"));
+    }
+
+    #[test]
+    fn test_fork_release_notes_urls() {
+        let version = Version::parse("1.2.3").expect("valid version");
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Stable, Some(&version)),
+            "https://github.com/jason-rl/zed/releases/tag/v1.2.3"
+        );
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Preview, Some(&version)),
+            "https://github.com/jason-rl/zed/releases/tag/v1.2.3"
+        );
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Nightly, None),
+            "https://github.com/jason-rl/zed/commits/nightly/"
+        );
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Dev, None),
+            "https://github.com/jason-rl/zed/commits/main/"
+        );
     }
 
     #[gpui::test]
@@ -1613,6 +1869,72 @@ mod tests {
         );
 
         assert_eq!(newer_version.unwrap(), Some(fetched_version));
+    }
+
+    #[test]
+    fn test_stable_does_update_when_same_version_was_published_from_a_new_commit() {
+        let installed_version = semver::Version::new(1, 15, 0);
+        let installed_commit_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let release_commit_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let newer_version = AutoUpdater::check_if_fetched_desktop_release_is_newer(
+            installed_version.clone(),
+            Some(installed_commit_sha),
+            None,
+            installed_version,
+            Some(release_commit_sha),
+        );
+
+        assert_eq!(newer_version, Some(semver::Version::new(1, 15, 0)),);
+    }
+
+    #[test]
+    fn test_stable_same_version_requires_an_uninstalled_release_commit() {
+        let version = semver::Version::new(1, 15, 0);
+        let release_commit_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let cases = [
+            (Some(release_commit_sha), None, Some(release_commit_sha)),
+            (None, Some(release_commit_sha), Some(release_commit_sha)),
+            (None, None, Some(release_commit_sha)),
+            (None, None, None),
+        ];
+
+        for (installed_commit_sha, installed_update_commit_sha, fetched_commit_sha) in cases {
+            assert_eq!(
+                AutoUpdater::check_if_fetched_desktop_release_is_newer(
+                    version.clone(),
+                    installed_commit_sha,
+                    installed_update_commit_sha,
+                    version.clone(),
+                    fetched_commit_sha,
+                ),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn test_stable_version_precedence_does_not_require_a_release_commit() {
+        assert_eq!(
+            AutoUpdater::check_if_fetched_desktop_release_is_newer(
+                semver::Version::new(1, 15, 0),
+                None,
+                None,
+                semver::Version::new(1, 15, 1),
+                None,
+            ),
+            Some(semver::Version::new(1, 15, 1)),
+        );
+        assert_eq!(
+            AutoUpdater::check_if_fetched_desktop_release_is_newer(
+                semver::Version::new(1, 15, 0),
+                None,
+                None,
+                semver::Version::new(1, 14, 9),
+                Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            ),
+            None,
+        );
     }
 
     #[test]
