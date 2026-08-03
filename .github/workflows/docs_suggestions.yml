@@ -9,24 +9,6 @@ name: Documentation Suggestions
 # 5. Keep this workflow focused on suggestions only until that stable workflow is added.
 
 on:
-  # Run when PRs are merged to main
-  pull_request:
-    types: [closed]
-    branches: [main]
-    paths:
-      - 'crates/**/*.rs'
-      - '!crates/**/*_test.rs'
-      - '!crates/**/tests/**'
-
-  # Run on cherry-picks to release branches
-  pull_request_target:
-    types: [opened, synchronize]
-    branches:
-      - 'v0.*'
-    paths:
-      - 'crates/**/*.rs'
-
-  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       pr_number:

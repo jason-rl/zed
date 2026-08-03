@@ -19,20 +19,6 @@
 name: Triage Project Sync (#84)
 
 on:
-  issues:
-    types:
-      - opened
-      - reopened
-      - closed
-      - labeled
-      - unlabeled
-      - assigned
-      - unassigned
-      - edited
-  issue_comment:
-    types: [created]
-  schedule:
-    - cron: "0 6 * * *" # daily 06:00 UTC
   workflow_dispatch:
     inputs:
       issue_number:
