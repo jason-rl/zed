@@ -2,15 +2,7 @@
 # Rebuild with `cargo xtask workflows`.
 name: danger
 on:
-  merge_group: {}
-  pull_request:
-    types:
-    - opened
-    - synchronize
-    - reopened
-    - edited
-    branches:
-    - main
+  workflow_dispatch: {}
 permissions:
   contents: read
 jobs:

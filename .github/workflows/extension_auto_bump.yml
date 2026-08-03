@@ -2,14 +2,7 @@
 # Rebuild with `cargo xtask workflows`.
 name: extension_auto_bump
 on:
-  push:
-    branches:
-    - main
-    paths:
-    - extensions/**
-    - '!extensions/test-extension/**'
-    - '!extensions/workflows/**'
-    - '!extensions/*.md'
+  workflow_dispatch: {}
 permissions:
   contents: read
 jobs:

@@ -9,16 +9,6 @@ name: Documentation Suggestions
 # 5. Keep this workflow focused on suggestions only until that stable workflow is added.
 
 on:
-  # Analyze merged PRs on main and cherry-picks to release branches. Each job
-  # further restricts the event actions and target branch that it handles.
-  pull_request:
-    types: [closed, opened, synchronize]
-    branches:
-      - main
-      - "v0.*"
-    paths:
-      - "crates/**/*.rs"
-
   # Manual trigger for testing
   workflow_dispatch:
     inputs:

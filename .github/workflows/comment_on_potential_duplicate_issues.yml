@@ -1,8 +1,6 @@
 name: Comment on potential duplicate bug/crash reports
 
 on:
-  issues:
-    types: [opened]
   workflow_dispatch:
     inputs:
       issue_number:

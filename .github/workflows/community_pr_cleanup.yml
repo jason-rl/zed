@@ -4,8 +4,6 @@
 name: Community PR Cleanup
 
 on:
-  schedule:
-    - cron: "30 8 * * *"
   workflow_dispatch:
     inputs:
       dry-run:

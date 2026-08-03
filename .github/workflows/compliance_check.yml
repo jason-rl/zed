@@ -4,8 +4,6 @@ name: compliance_check
 env:
   CARGO_TERM_COLOR: always
 on:
-  schedule:
-  - cron: 30 17 * * 2
   workflow_dispatch: {}
 permissions:
   contents: read

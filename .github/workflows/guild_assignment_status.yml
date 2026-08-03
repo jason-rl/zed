@@ -6,11 +6,7 @@
 name: Guild Assignment Status
 
 on:
-  issues:
-    types: [assigned, unassigned]
-  issue_comment:
-    types: [created]
-
+  workflow_dispatch: {}
 permissions:
   contents: read
 

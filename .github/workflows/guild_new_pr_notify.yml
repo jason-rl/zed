@@ -7,11 +7,7 @@
 name: Guild New PR Notification
 
 on:
-  # zizmor: ignore[dangerous-triggers]
-  # Fork PRs must be supported, but this workflow only reads event metadata and
-  # checks out scripts from the trusted default branch; it never executes PR code.
-  pull_request_target:
-    types: [opened]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
