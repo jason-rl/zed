@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{cell::Cell, ops::Range, rc::Rc, sync::Arc};
 
 use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk};
 use agent::ThreadStore;
@@ -48,6 +48,9 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp::ToolCallId>,
+    auto_expanded_terminal_tool_calls: HashSet<acp::ToolCallId>,
+    terminal_tool_calls_over_auto_expand_limit: HashSet<acp::ToolCallId>,
+    user_toggled_tool_calls: HashSet<acp::ToolCallId>,
     expanded_wait_tool_call_groups: HashSet<acp::ToolCallId>,
 }
 
@@ -71,6 +74,9 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            auto_expanded_terminal_tool_calls: HashSet::default(),
+            terminal_tool_calls_over_auto_expand_limit: HashSet::default(),
+            user_toggled_tool_calls: HashSet::default(),
             expanded_wait_tool_call_groups: HashSet::default(),
         }
     }
@@ -85,11 +91,44 @@ impl EntryViewState {
 
     pub(crate) fn collapse_tool_call(&mut self, tool_call_id: &acp::ToolCallId) {
         self.expanded_tool_calls.remove(tool_call_id);
+        self.auto_expanded_terminal_tool_calls.remove(tool_call_id);
+        self.user_toggled_tool_calls.insert(tool_call_id.clone());
     }
 
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp::ToolCallId) {
+        self.auto_expanded_terminal_tool_calls.remove(tool_call_id);
+        self.user_toggled_tool_calls.insert(tool_call_id.clone());
         if !self.expanded_tool_calls.remove(tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn auto_expand_terminal_tool_call(&mut self, tool_call_id: acp::ToolCallId) {
+        if self.user_toggled_tool_calls.contains(&tool_call_id)
+            || self
+                .terminal_tool_calls_over_auto_expand_limit
+                .contains(&tool_call_id)
+        {
+            return;
+        }
+        self.expanded_tool_calls.insert(tool_call_id.clone());
+        self.auto_expanded_terminal_tool_calls.insert(tool_call_id);
+    }
+
+    pub(crate) fn mark_terminal_tool_call_over_auto_expand_limit(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+    ) {
+        self.terminal_tool_calls_over_auto_expand_limit
+            .insert(tool_call_id);
+    }
+
+    pub(crate) fn collapse_auto_expanded_terminal_tool_call(
+        &mut self,
+        tool_call_id: &acp::ToolCallId,
+    ) {
+        if self.auto_expanded_terminal_tool_calls.remove(tool_call_id) {
+            self.expanded_tool_calls.remove(tool_call_id);
         }
     }
 
@@ -331,6 +370,32 @@ impl EntryViewState {
                 for terminal in terminals {
                     match views.entry(terminal.entity_id()) {
                         collections::hash_map::Entry::Vacant(entry) => {
+                            let inner_terminal = terminal.read(cx).inner().clone();
+                            let initial_line_count =
+                                terminal_output_line_count(&inner_terminal.read(cx).get_content());
+                            let last_line_count = Rc::new(Cell::new(initial_line_count));
+                            cx.subscribe(&inner_terminal, {
+                                let id = id.clone();
+                                let last_line_count = last_line_count.clone();
+                                move |_this, terminal, event: &terminal::Event, cx| {
+                                    if !matches!(event, terminal::Event::Wakeup) {
+                                        return;
+                                    }
+                                    let line_count = terminal_output_line_count(
+                                        &terminal.read(cx).get_content(),
+                                    );
+                                    if line_count != last_line_count.replace(line_count) {
+                                        cx.emit(EntryViewEvent {
+                                            entry_index: index,
+                                            view_event: ViewEvent::TerminalOutputLineCountChanged {
+                                                tool_call_id: id.clone(),
+                                                line_count,
+                                            },
+                                        });
+                                    }
+                                }
+                            })
+                            .detach();
                             let element = create_terminal(
                                 self.workspace.clone(),
                                 self.project.clone(),
@@ -341,7 +406,10 @@ impl EntryViewState {
                             .into_any();
                             cx.emit(EntryViewEvent {
                                 entry_index: index,
-                                view_event: ViewEvent::NewTerminal(id.clone()),
+                                view_event: ViewEvent::NewTerminal {
+                                    tool_call_id: id.clone(),
+                                    line_count: initial_line_count,
+                                },
                             });
                             entry.insert(element);
                         }
@@ -517,7 +585,14 @@ pub struct EntryViewEvent {
 
 pub enum ViewEvent {
     NewDiff(acp::ToolCallId),
-    NewTerminal(acp::ToolCallId),
+    NewTerminal {
+        tool_call_id: acp::ToolCallId,
+        line_count: usize,
+    },
+    TerminalOutputLineCountChanged {
+        tool_call_id: acp::ToolCallId,
+        line_count: usize,
+    },
     TerminalMovedToBackground(acp::ToolCallId),
     MessageEditorEvent(Entity<MessageEditor>, MessageEditorEvent),
     OpenDiffLocation {
@@ -525,6 +600,10 @@ pub enum ViewEvent {
         position: Point,
         split: bool,
     },
+}
+
+fn terminal_output_line_count(output: &str) -> usize {
+    output.lines().count()
 }
 
 #[derive(Debug)]
@@ -749,6 +828,17 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use workspace::{MultiWorkspace, PathList};
+
+    #[test]
+    fn test_terminal_output_line_count() {
+        use super::terminal_output_line_count;
+
+        assert_eq!(terminal_output_line_count(""), 0);
+        assert_eq!(terminal_output_line_count("one"), 1);
+        assert_eq!(terminal_output_line_count("one\n"), 1);
+        assert_eq!(terminal_output_line_count(&vec!["line"; 10].join("\n")), 10);
+        assert_eq!(terminal_output_line_count(&vec!["line"; 11].join("\n")), 11);
+    }
 
     #[test]
     fn test_reindex_after_removal() {
