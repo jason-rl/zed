@@ -8,6 +8,8 @@ target_dir="release"
 open_result=false
 local_install=false
 can_code_sign=false
+build_group=""
+package_only=false
 
 # This must match the team in the provisioning profile.
 IDENTITY="Zed Industries, Inc."
@@ -20,6 +22,8 @@ Usage: ${0##*/} [options] [architecture=host]
 Build the application bundle for macOS.
 
 Options:
+  -b    Build only app or remote-server, including debug symbols (release only).
+  -p    Package prebuilt binaries and debug symbols (release only).
   -d    Compile in debug mode
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
@@ -27,9 +31,11 @@ Options:
   "
 }
 
-while getopts 'dloih' flag
+while getopts 'b:pdloih' flag
 do
     case "${flag}" in
+        b) build_group="$OPTARG";;
+        p) package_only=true;;
         o) open_result=true;;
         d)
             export CARGO_INCREMENTAL=true
@@ -42,11 +48,22 @@ do
            help_info
            exit 0
            ;;
+        \?) exit 1;;
     esac
 done
 
 shift $((OPTIND-1))
 
+if [[ -n "$build_group" && "$build_group" != app && "$build_group" != remote-server ]]; then
+    echo "Build group must be app or remote-server" >&2
+    exit 1
+fi
+if [[ -n "$build_group" || "$package_only" == true ]]; then
+    if [[ "$target_dir" != release || "$local_install" == true || "$open_result" == true || ( -n "$build_group" && "$package_only" == true ) ]]; then
+        echo "Build-only and package-only modes are mutually exclusive and cannot be combined with -d, -i, or -o" >&2
+        exit 1
+    fi
+fi
 
 # Get release channel
 pushd crates/zed
@@ -55,11 +72,6 @@ export ZED_RELEASE_CHANNEL="${channel}"
 popd
 
 export ZED_BUNDLE=true
-
-cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
-if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
-    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
-fi
 
 # Deal with versions of macOS that don't include libstdc++ headers
 export CXXFLAGS="-stdlib=libc++"
@@ -81,16 +93,69 @@ else
     exit 1
 fi
 
-# Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+debug_symbols_extracted=false
+symbol_binaries=(zed remote_server)
+function extract_debug_symbols() {
+    if [ "$debug_symbols_extracted" = true ]; then
+        return
+    fi
+    local binary
+    for binary in "${symbol_binaries[@]}"; do
+        if ! dsymutil --flat "target/${target_triple}/${target_dir}/${binary}" 2> "target/dsymutil-${binary}.log"; then
+            echo "dsymutil failed for ${binary}" >&2
+            cat "target/dsymutil-${binary}.log" >&2
+            exit 1
+        fi
+    done
+    debug_symbols_extracted=true
+}
 
-rustup target add $target_triple
+if [[ "$package_only" == true ]]; then
+    for binary in zed cli remote_server; do
+        binary_path="target/${target_triple}/${target_dir}/${binary}"
+        if [[ ! -s "$binary_path" || ! -x "$binary_path" ]]; then
+            echo "Missing or non-executable prebuilt binary: ${binary_path}" >&2
+            exit 1
+        fi
+    done
+    for binary in "${symbol_binaries[@]}"; do
+        if [[ ! -s "target/${target_triple}/${target_dir}/${binary}.dwarf" ]]; then
+            echo "Missing prebuilt debug symbols for ${binary}" >&2
+            exit 1
+        fi
+    done
+    # The build runners still have the object files needed by dsymutil.
+    debug_symbols_extracted=true
+else
+    timing_flag=""
+    if [[ -n "$build_group" ]]; then
+        timing_flag="--timings"
+    fi
+    rustup target add "$target_triple"
+    if [[ "$build_group" != remote-server ]]; then
+        # Generate the licenses first, so they can be baked into the binaries.
+        script/generate-licenses
+        cargo --config .cargo/bundle-config.toml build ${build_flag} ${timing_flag} --package zed --package cli --target "$target_triple"
+    fi
+    if [[ "$build_group" != app ]]; then
+        # Keep remote_server's features separate from the application's.
+        cargo --config .cargo/bundle-config.toml build ${build_flag} ${timing_flag} --package remote_server --target "$target_triple"
+    fi
+    if [[ -n "$build_group" ]]; then
+        if [[ "$build_group" == app ]]; then
+            symbol_binaries=(zed)
+        else
+            symbol_binaries=(remote_server)
+        fi
+        extract_debug_symbols
+        exit 0
+    fi
+fi
 
-echo "Compiling zed binaries"
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo --config .cargo/bundle-config.toml build ${build_flag} --package remote_server --target $target_triple
+cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
+if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -100,7 +165,8 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+# Both build paths above already supply binaries with the bundle compiler flags.
+app_path=$(CARGO_BUNDLE_SKIP_BUILD=true cargo bundle ${build_flag} --target "$target_triple" --select-workspace-root | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd
@@ -289,24 +355,6 @@ function sign_binary() {
     if [[ $can_code_sign = true ]]; then
         echo "Code signing executable $binary_path"
         /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${binary_path}" -v
-    fi
-}
-
-debug_symbols_extracted=false
-function extract_debug_symbols() {
-    if [ "$debug_symbols_extracted" = true ]; then
-        return
-    fi
-    debug_symbols_extracted=true
-    if ! dsymutil --flat "target/${target_triple}/${target_dir}/zed" 2> target/dsymutil.log; then
-        echo "dsymutil failed"
-        cat target/dsymutil.log
-        exit 1
-    fi
-    if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
-        echo "dsymutil failed"
-        cat target/dsymutil.log
-        exit 1
     fi
 }
 
