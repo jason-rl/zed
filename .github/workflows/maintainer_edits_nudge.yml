@@ -1,11 +1,7 @@
 name: Maintainer Edits Nudge
 
 on:
-  # zizmor: ignore[dangerous-triggers]
-  # Fork PRs must be supported, but this workflow only reads GitHub metadata and
-  # posts a comment; it never checks out or executes PR code.
-  pull_request_target:
-    types: [opened, reopened]
+  workflow_dispatch: {}
 
 permissions: {}
 
