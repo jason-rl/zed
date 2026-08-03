@@ -4,9 +4,7 @@ name: deploy_collab
 env:
   DOCKER_BUILDKIT: '1'
 on:
-  push:
-    tags:
-    - collab-production
+  workflow_dispatch: {}
 permissions:
   contents: read
 jobs:
