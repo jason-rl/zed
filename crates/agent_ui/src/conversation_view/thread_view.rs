@@ -1298,16 +1298,40 @@ impl ThreadView {
                     });
                 }
             }
-            ViewEvent::NewTerminal(tool_call_id) => {
+            ViewEvent::NewTerminal {
+                tool_call_id,
+                line_count,
+            } => {
                 if AgentSettings::get_global(cx).expand_terminal_card {
                     self.entry_view_state.update(cx, |state, _cx| {
-                        state.expand_tool_call(tool_call_id.clone());
+                        state.auto_expand_terminal_tool_call(tool_call_id.clone());
                     });
+                    if *line_count > 10 {
+                        self.entry_view_state.update(cx, |state, _cx| {
+                            state.mark_terminal_tool_call_over_auto_expand_limit(
+                                tool_call_id.clone(),
+                            );
+                        });
+                        self.collapse_auto_expanded_terminals_in_current_turn(
+                            event.entry_index,
+                            cx,
+                        );
+                    }
                 }
             }
+            ViewEvent::TerminalOutputLineCountChanged {
+                tool_call_id,
+                line_count,
+            } if *line_count > 10 => {
+                self.entry_view_state.update(cx, |state, _cx| {
+                    state.mark_terminal_tool_call_over_auto_expand_limit(tool_call_id.clone());
+                });
+                self.collapse_auto_expanded_terminals_in_current_turn(event.entry_index, cx);
+            }
+            ViewEvent::TerminalOutputLineCountChanged { .. } => {}
             ViewEvent::TerminalMovedToBackground(tool_call_id) => {
                 self.entry_view_state.update(cx, |state, _cx| {
-                    state.collapse_tool_call(tool_call_id);
+                    state.collapse_auto_expanded_terminal_tool_call(tool_call_id);
                 });
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Focus) => {
@@ -1356,6 +1380,36 @@ impl ThreadView {
                 self.open_diff_location(path, *position, *split, window, cx);
             }
         }
+    }
+
+    fn collapse_auto_expanded_terminals_in_current_turn(
+        &mut self,
+        entry_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_tool_call_ids = self
+            .thread
+            .read(cx)
+            .entries()
+            .get(..=entry_index)
+            .into_iter()
+            .flatten()
+            .rev()
+            .take_while(|entry| !matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .filter_map(|entry| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                tool_call.terminals().next().map(|_| tool_call.id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        self.entry_view_state.update(cx, |state, _cx| {
+            for tool_call_id in terminal_tool_call_ids {
+                state.collapse_auto_expanded_terminal_tool_call(&tool_call_id);
+            }
+        });
+        cx.notify();
     }
 
     fn open_diff_location(
@@ -6361,42 +6415,42 @@ impl ThreadView {
                     if entry_ix + 1 != range.end {
                         return Empty.into_any();
                     }
-                    return self.render_wait_tool_call_group(range.clone(), window, cx);
-                }
-
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status, ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content.iter().any(|content| match content {
-                            ToolCallContent::ContentBlock(block) => block.visible_content(cx),
-                            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
-                    }
-                }
-
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
-                    entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
-                    cx,
-                );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
+                    self.render_wait_tool_call_group(range.clone(), window, cx)
                 } else {
-                    tool_call.into_any()
+                    // A canceled tool call that produced visible output is still worth
+                    // showing, but one that was canceled before producing anything just
+                    // renders as a useless "Canceled" card — hide those entirely.
+                    if matches!(tool_call.status, ToolCallStatus::Canceled) {
+                        let has_visible_content =
+                            tool_call.content.iter().any(|content| match content {
+                                ToolCallContent::ContentBlock(block) => block.visible_content(cx),
+                                ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
+                            });
+                        if !has_visible_content {
+                            return Empty.into_any();
+                        }
+                    }
+
+                    let tool_call = self.render_any_tool_call(
+                        self.thread.read(cx).session_id(),
+                        entry_ix,
+                        tool_call,
+                        &self.focus_handle(cx),
+                        ToolCallLayout::Standalone,
+                        window,
+                        cx,
+                    );
+
+                    if let Some(handle) = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.focus_handle(cx))
+                    {
+                        tool_call.track_focus(&handle).into_any()
+                    } else {
+                        tool_call.into_any()
+                    }
                 }
             }
             AgentThreadEntry::Elicitation(elicitation_id) => {
