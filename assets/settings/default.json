@@ -1256,7 +1256,7 @@
     //
     // Default: true
     "expand_edit_card": true,
-    // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
+    // Whether to automatically expand terminal cards in the agent panel. Cards collapse when output exceeds 10 lines.
     //
     // Default: true
     "expand_terminal_card": true,
