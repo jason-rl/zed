@@ -1,10 +1,7 @@
 name: Bump collab-staging Tag
 
 on:
-  schedule:
-    # Fire every day at 16:00 UTC (At the start of the US workday)
-    - cron: "0 16 * * *"
-
+  workflow_dispatch: {}
 permissions:
   contents: read
 

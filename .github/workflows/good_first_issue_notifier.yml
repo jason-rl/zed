@@ -1,9 +1,7 @@
 name: Good First Issue Notifier
 
 on:
-  issues:
-    types: [labeled]
-
+  workflow_dispatch: {}
 permissions:
   contents: read
 

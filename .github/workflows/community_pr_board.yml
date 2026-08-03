@@ -12,13 +12,6 @@
 name: Community PR Board
 
 on:
-  # zizmor: ignore[dangerous-triggers]
-  # Fork PRs must be supported, but this workflow only reads event metadata and
-  # checks out scripts from the trusted default branch; it never executes PR code.
-  pull_request_target:
-    types: [labeled, unlabeled, assigned, review_requested, edited]
-  issue_comment:
-    types: [created]
   workflow_dispatch:
     inputs:
       pr_number:
