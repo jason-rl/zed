@@ -47,6 +47,8 @@ impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+const FORK_RELEASE_API_URL: &str = "https://api.github.com/repos/jason-rl/zed/releases/latest";
+const FORK_RELEASE_ASSET_NAME: &str = "Zed-aarch64.dmg";
 
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
@@ -187,6 +189,64 @@ pub struct AutoUpdater {
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+async fn get_desktop_release_asset(
+    http_client: Arc<dyn HttpClient>,
+    os: &str,
+    arch: &str,
+) -> Result<ReleaseAsset> {
+    anyhow::ensure!(
+        os == "macos" && arch == "aarch64",
+        "unsupported platform for fork auto-updates: {os}-{arch}"
+    );
+
+    let mut response = http_client
+        .get(FORK_RELEASE_API_URL, Default::default(), true)
+        .await?;
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+
+    anyhow::ensure!(
+        response.status().is_success(),
+        "failed to fetch fork release: HTTP {}: {:?}",
+        response.status(),
+        String::from_utf8_lossy(&body),
+    );
+
+    let release: GitHubRelease = serde_json::from_slice(&body).with_context(|| {
+        format!(
+            "error deserializing fork release {:?}",
+            String::from_utf8_lossy(&body),
+        )
+    })?;
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .context("fork release tag must start with 'v'")?;
+    let version = Version::parse(version).context("fork release tag must contain a semver")?;
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == FORK_RELEASE_ASSET_NAME)
+        .with_context(|| format!("fork release is missing {FORK_RELEASE_ASSET_NAME}"))?;
+
+    Ok(ReleaseAsset {
+        version: version.to_string(),
+        url: asset.browser_download_url,
+    })
 }
 
 struct MacOsUnmounter<'a> {
@@ -338,23 +398,39 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
 
 pub fn release_notes_url(cx: &mut App) -> Option<String> {
     let release_channel = ReleaseChannel::try_global(cx)?;
-    let url = match release_channel {
+    let current_version = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
             let auto_updater = AutoUpdater::get(cx)?;
             let auto_updater = auto_updater.read(cx);
             let mut current_version = auto_updater.current_version.clone();
             current_version.pre = semver::Prerelease::EMPTY;
             current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+            Some(current_version)
         }
-        ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
-        }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        ReleaseChannel::Nightly | ReleaseChannel::Dev => None,
     };
-    Some(url)
+    Some(fork_release_notes_url(
+        release_channel,
+        current_version.as_ref(),
+    ))
+}
+
+fn fork_release_notes_url(
+    release_channel: ReleaseChannel,
+    current_version: Option<&Version>,
+) -> String {
+    match (release_channel, current_version) {
+        (ReleaseChannel::Stable | ReleaseChannel::Preview, Some(current_version)) => {
+            format!("https://github.com/jason-rl/zed/releases/tag/v{current_version}")
+        }
+        (ReleaseChannel::Nightly, _) => {
+            "https://github.com/jason-rl/zed/commits/nightly/".to_string()
+        }
+        (ReleaseChannel::Dev, _) => "https://github.com/jason-rl/zed/commits/main/".to_string(),
+        (ReleaseChannel::Stable | ReleaseChannel::Preview, None) => {
+            "https://github.com/jason-rl/zed/releases".to_string()
+        }
+    }
 }
 
 pub fn view_release_notes(_: &ViewReleaseNotes, cx: &mut App) -> Option<()> {
@@ -721,8 +797,7 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+        let fetched_release_data = get_desktop_release_asset(client.clone(), OS, ARCH).await?;
         let fetched_version = fetched_release_data.clone().version;
         let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
         let newer_version = Self::check_if_fetched_version_is_newer(
@@ -1380,14 +1455,16 @@ mod tests {
                 let release_available = release_available.load(atomic::Ordering::Relaxed);
                 let dmg_rx = dmg_rx.clone();
                 async move {
-                if req.uri().path() == "/releases/stable/latest/asset" {
+                if req.uri().to_string()
+                    == "https://api.github.com/repos/jason-rl/zed/releases/latest"
+                {
                     if release_available {
                         return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.1","url":"https://test.example/new-download"}"#.into()
+                            r#"{"tag_name":"v0.100.1","assets":[{"name":"Zed-aarch64.dmg","browser_download_url":"https://test.example/new-download"}]}"#.into()
                         ).unwrap());
                     } else {
                         return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.0","url":"https://test.example/old-download"}"#.into()
+                            r#"{"tag_name":"v0.100.0","assets":[{"name":"Zed-aarch64.dmg","browser_download_url":"https://test.example/old-download"}]}"#.into()
                         ).unwrap());
                     }
                 } else if req.uri().path() == "/new-download" {
@@ -1467,6 +1544,92 @@ mod tests {
         let path = will_restart.await.unwrap().unwrap();
         assert_eq!(path, tmp_dir.path().join("zed"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "<fake-zed-update>");
+    }
+
+    #[gpui::test]
+    async fn test_get_desktop_release_asset_from_fork() {
+        let client = FakeHttpClient::create(|request| async move {
+            assert_eq!(
+                request.uri().to_string(),
+                "https://api.github.com/repos/jason-rl/zed/releases/latest"
+            );
+            Ok(Response::builder()
+                .status(200)
+                .body(
+                    r#"{"tag_name":"v1.2.3","assets":[{"name":"other.zip","browser_download_url":"https://example.com/other.zip"},{"name":"Zed-aarch64.dmg","browser_download_url":"https://example.com/Zed-aarch64.dmg"}]}"#
+                        .into(),
+                )
+                .expect("valid response"))
+        });
+
+        let release = get_desktop_release_asset(client, "macos", "aarch64")
+            .await
+            .expect("fork release should parse");
+        assert_eq!(release.version, "1.2.3");
+        assert_eq!(release.url, "https://example.com/Zed-aarch64.dmg");
+    }
+
+    #[gpui::test]
+    async fn test_get_desktop_release_asset_reports_invalid_releases() {
+        let cases = [
+            (200, r#"{"tag_name":"1.2.3","assets":[]}"#, "tag"),
+            (
+                200,
+                r#"{"tag_name":"v1.2.3","assets":[]}"#,
+                "Zed-aarch64.dmg",
+            ),
+            (200, r#"not json"#, "deserializing"),
+            (503, r#"unavailable"#, "failed to fetch"),
+        ];
+
+        for (status, body, expected_error) in cases {
+            let body = body.to_string();
+            let client = FakeHttpClient::create(move |_request| {
+                let body = body.clone();
+                async move {
+                    Ok(Response::builder()
+                        .status(status)
+                        .body(body.into())
+                        .expect("valid response"))
+                }
+            });
+            let error = get_desktop_release_asset(client, "macos", "aarch64")
+                .await
+                .expect_err("invalid release should fail");
+            assert!(
+                error.to_string().contains(expected_error),
+                "expected {error:?} to contain {expected_error:?}"
+            );
+        }
+
+        let client = FakeHttpClient::create(|_request| async move {
+            panic!("unsupported platforms should not make a request")
+        });
+        let error = get_desktop_release_asset(client, "linux", "x86_64")
+            .await
+            .expect_err("unsupported platform should fail");
+        assert!(error.to_string().contains("unsupported platform"));
+    }
+
+    #[test]
+    fn test_fork_release_notes_urls() {
+        let version = Version::parse("1.2.3").expect("valid version");
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Stable, Some(&version)),
+            "https://github.com/jason-rl/zed/releases/tag/v1.2.3"
+        );
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Preview, Some(&version)),
+            "https://github.com/jason-rl/zed/releases/tag/v1.2.3"
+        );
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Nightly, None),
+            "https://github.com/jason-rl/zed/commits/nightly/"
+        );
+        assert_eq!(
+            fork_release_notes_url(ReleaseChannel::Dev, None),
+            "https://github.com/jason-rl/zed/commits/main/"
+        );
     }
 
     #[gpui::test]
