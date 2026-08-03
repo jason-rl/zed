@@ -687,6 +687,40 @@ enum ToolCallLayout {
     Floating,
 }
 
+pub(super) fn consecutive_wait_tool_call_group_range(
+    entries: &[AgentThreadEntry],
+    entry_ix: usize,
+) -> Option<std::ops::Range<usize>> {
+    let AgentThreadEntry::ToolCall(tool_call) = entries.get(entry_ix)? else {
+        return None;
+    };
+    if tool_call.tool_name.as_deref() != Some("wait") {
+        return None;
+    }
+
+    let mut start = entry_ix;
+    while start > 0
+        && matches!(
+            entries.get(start - 1),
+            Some(AgentThreadEntry::ToolCall(tool_call))
+                if tool_call.tool_name.as_deref() == Some("wait")
+        )
+    {
+        start -= 1;
+    }
+
+    let mut end = entry_ix + 1;
+    while matches!(
+        entries.get(end),
+        Some(AgentThreadEntry::ToolCall(tool_call))
+            if tool_call.tool_name.as_deref() == Some("wait")
+    ) {
+        end += 1;
+    }
+
+    (end - start >= 2).then_some(start..end)
+}
+
 impl ToolCallLayout {
     /// Stable discriminant used to disambiguate element ids when the same tool
     /// call is rendered in more than one layout at once (e.g. inline in the
@@ -6390,6 +6424,17 @@ impl ThreadView {
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
+                let wait_group_range = consecutive_wait_tool_call_group_range(
+                    self.thread.read(cx).entries(),
+                    entry_ix,
+                );
+                if let Some(range) = &wait_group_range {
+                    if entry_ix + 1 != range.end {
+                        return Empty.into_any();
+                    }
+                    return self.render_wait_tool_call_group(range.clone(), window, cx);
+                }
+
                 // A canceled tool call that produced visible output is still worth
                 // showing, but one that was canceled before producing anything just
                 // renders as a useless "Canceled" card — hide those entirely.
@@ -6603,6 +6648,94 @@ impl ThreadView {
         } else {
             primary
         }
+    }
+
+    fn render_wait_tool_call_group(
+        &self,
+        range: std::ops::Range<usize>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let thread = self.thread.read(cx);
+        let Some(AgentThreadEntry::ToolCall(first_tool_call)) = thread.entries().get(range.start)
+        else {
+            return Empty.into_any();
+        };
+        let first_tool_call_id = first_tool_call.id.clone();
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_wait_tool_call_group_expanded(&first_tool_call_id);
+        let active_session_id = thread.session_id().clone();
+
+        v_flex()
+            .id(SharedString::from(format!(
+                "wait-tool-call-group-{}",
+                first_tool_call_id.0
+            )))
+            .mx_2()
+            .my_1()
+            .rounded_md()
+            .border_1()
+            .border_color(self.tool_card_border_color(cx))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!(
+                        "wait-tool-call-group-header-{}",
+                        first_tool_call_id.0
+                    )))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Disclosure::new(
+                            SharedString::from(format!(
+                                "wait-tool-call-group-disclosure-{}",
+                                first_tool_call_id.0
+                            )),
+                            is_expanded,
+                        )
+                        .opened_icon(IconName::ChevronUp)
+                        .closed_icon(IconName::ChevronDown),
+                    )
+                    .child(
+                        Label::new(format!("Wait ({} calls)", range.len()))
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener({
+                        let first_tool_call_id = first_tool_call_id.clone();
+                        move |this, _, window, cx| {
+                            this.entry_view_state.update(cx, |state, _cx| {
+                                state.toggle_wait_tool_call_group_expansion(&first_tool_call_id);
+                            });
+                            this.refresh_thread_search(window, cx);
+                            cx.notify();
+                        }
+                    })),
+            )
+            .when(is_expanded, |this| {
+                this.children(range.filter_map(|entry_ix| {
+                    let AgentThreadEntry::ToolCall(tool_call) = thread.entries().get(entry_ix)?
+                    else {
+                        return None;
+                    };
+                    Some(self.render_any_tool_call(
+                        &active_session_id,
+                        entry_ix,
+                        tool_call,
+                        &self.focus_handle(cx),
+                        ToolCallLayout::Embedded,
+                        window,
+                        cx,
+                    ))
+                }))
+            })
+            .into_any_element()
     }
 
     fn render_elicitation(
@@ -12682,6 +12815,100 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
         ))
+    }
+
+    fn tool_call_entry(
+        id: &str,
+        tool_name: Option<&str>,
+        cx: &mut gpui::TestAppContext,
+    ) -> AgentThreadEntry {
+        AgentThreadEntry::ToolCall(ToolCall {
+            id: acp::ToolCallId::new(id),
+            label: cx.new(|cx| Markdown::new_text(id.to_string().into(), cx)),
+            kind: acp::ToolKind::Other,
+            content: Vec::new(),
+            status: ToolCallStatus::Completed,
+            locations: Vec::new(),
+            resolved_locations: Vec::new(),
+            raw_input: None,
+            raw_input_markdown: None,
+            raw_output: None,
+            tool_name: tool_name.map(SharedString::from),
+            subagent_session_info: None,
+            sandbox_authorization_details: None,
+            sandbox_fallback_authorization_details: None,
+            sandbox_not_applied: None,
+        })
+    }
+
+    #[gpui::test]
+    fn test_consecutive_wait_tool_call_group_range(cx: &mut gpui::TestAppContext) {
+        let entries = vec![
+            tool_call_entry("wait-1", Some("wait"), cx),
+            tool_call_entry("wait-2", Some("wait"), cx),
+            tool_call_entry("wait-3", Some("wait"), cx),
+        ];
+
+        assert_eq!(
+            consecutive_wait_tool_call_group_range(&entries, 0),
+            Some(0..3)
+        );
+        assert_eq!(
+            consecutive_wait_tool_call_group_range(&entries, 1),
+            Some(0..3)
+        );
+        assert_eq!(
+            consecutive_wait_tool_call_group_range(&entries, 2),
+            Some(0..3)
+        );
+    }
+
+    #[gpui::test]
+    fn test_wait_tool_call_group_requires_multiple_exact_wait_calls(cx: &mut gpui::TestAppContext) {
+        let entries = vec![tool_call_entry("wait-1", Some("wait"), cx)];
+        assert_eq!(consecutive_wait_tool_call_group_range(&entries, 0), None);
+
+        let entries = vec![
+            tool_call_entry("wait-1", Some("wait"), cx),
+            tool_call_entry("other", Some("read_file"), cx),
+            tool_call_entry("wait-2", Some("wait"), cx),
+            tool_call_entry("missing-name", None, cx),
+        ];
+        for entry_ix in 0..entries.len() {
+            assert_eq!(
+                consecutive_wait_tool_call_group_range(&entries, entry_ix),
+                None
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_non_wait_tool_call_splits_wait_groups(cx: &mut gpui::TestAppContext) {
+        let entries = vec![
+            tool_call_entry("wait-1", Some("wait"), cx),
+            tool_call_entry("wait-2", Some("wait"), cx),
+            tool_call_entry("other", Some("read_file"), cx),
+            tool_call_entry("wait-3", Some("wait"), cx),
+            tool_call_entry("wait-4", Some("wait"), cx),
+        ];
+
+        assert_eq!(
+            consecutive_wait_tool_call_group_range(&entries, 0),
+            Some(0..2)
+        );
+        assert_eq!(
+            consecutive_wait_tool_call_group_range(&entries, 1),
+            Some(0..2)
+        );
+        assert_eq!(consecutive_wait_tool_call_group_range(&entries, 2), None);
+        assert_eq!(
+            consecutive_wait_tool_call_group_range(&entries, 3),
+            Some(3..5)
+        );
+        assert_eq!(
+            consecutive_wait_tool_call_group_range(&entries, 4),
+            Some(3..5)
+        );
     }
 
     #[test]
