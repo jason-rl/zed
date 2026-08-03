@@ -48,6 +48,7 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp::ToolCallId>,
+    expanded_wait_tool_call_groups: HashSet<acp::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -70,6 +71,7 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            expanded_wait_tool_call_groups: HashSet::default(),
         }
     }
 
@@ -88,6 +90,27 @@ impl EntryViewState {
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp::ToolCallId) {
         if !self.expanded_tool_calls.remove(tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn is_wait_tool_call_group_expanded(
+        &self,
+        first_tool_call_id: &acp::ToolCallId,
+    ) -> bool {
+        self.expanded_wait_tool_call_groups
+            .contains(first_tool_call_id)
+    }
+
+    pub(crate) fn toggle_wait_tool_call_group_expansion(
+        &mut self,
+        first_tool_call_id: &acp::ToolCallId,
+    ) {
+        if !self
+            .expanded_wait_tool_call_groups
+            .remove(first_tool_call_id)
+        {
+            self.expanded_wait_tool_call_groups
+                .insert(first_tool_call_id.clone());
         }
     }
 

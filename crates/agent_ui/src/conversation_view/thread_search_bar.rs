@@ -24,6 +24,7 @@ use theme_settings::ThemeSettings;
 use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::paths::PathMatcher;
 
+use super::thread_view::consecutive_wait_tool_call_group_range;
 use crate::entry_view_state::EntryViewState;
 
 actions!(
@@ -328,6 +329,21 @@ impl ThreadSearchBar {
         let thread = self.thread.read(cx);
         let entry_view_state = self.entry_view_state.read(cx);
         for (entry_ix, entry) in thread.entries().iter().enumerate() {
+            let wait_group_range =
+                consecutive_wait_tool_call_group_range(thread.entries(), entry_ix);
+            if let Some(range) = &wait_group_range {
+                let Some(AgentThreadEntry::ToolCall(first_tool_call)) =
+                    thread.entries().get(range.start)
+                else {
+                    continue;
+                };
+                if !entry_view_state.is_wait_tool_call_group_expanded(&first_tool_call.id) {
+                    continue;
+                }
+            }
+            let visible_entry_ix = wait_group_range
+                .as_ref()
+                .map_or(entry_ix, |range| range.end - 1);
             match entry {
                 // Past user messages render through `MessageEditor`, not markdown.
                 AgentThreadEntry::UserMessage(_) => {
@@ -340,7 +356,7 @@ impl ThreadSearchBar {
                     };
                     let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
                     targets.push(SearchTarget::Editor {
-                        entry_ix,
+                        entry_ix: visible_entry_ix,
                         editor,
                         snapshot,
                     });
@@ -349,7 +365,7 @@ impl ThreadSearchBar {
                     for markdown in collect_markdowns(entry_ix, entry, &entry_view_state, cx) {
                         let source = markdown.read(cx).source().clone();
                         targets.push(SearchTarget::Markdown {
-                            entry_ix,
+                            entry_ix: visible_entry_ix,
                             markdown,
                             source,
                         });
