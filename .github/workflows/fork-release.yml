@@ -1,0 +1,102 @@
+name: Fork release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_LOG: warn
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+          check-latest: true
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          cache-targets: false
+      - name: Configure sccache error log
+        run: echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP}/sccache-error.log" >> "$GITHUB_ENV"
+      - name: Set up sccache
+        id: sccache
+        continue-on-error: true
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+      - name: Enable sccache
+        if: steps.sccache.outcome == 'success'
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Record build resources
+        run: |
+          system_profiler SPHardwareDataType
+          sysctl hw.memsize hw.ncpu
+          df -h
+      - name: Bundle Zed for Apple Silicon
+        run: |
+          set +e
+          ./script/bundle-mac aarch64-apple-darwin
+          build_status=$?
+          set -e
+          if [[ "${RUSTC_WRAPPER:-}" == "sccache" ]]; then
+            sccache --show-stats || true
+          fi
+          exit "$build_status"
+      - name: Record final resources
+        if: always()
+        run: |
+          top -l 1 -stats pid,command,cpu,mem
+          df -h
+      - name: Upload disk image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Zed-aarch64.dmg
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Download disk image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: Zed-aarch64.dmg
+          path: .
+      - name: Determine release version
+        run: |
+          version="$(sed -n '/^version = "/ { s/^version = "\([^"]*\)"/\1/p; q; }' crates/zed/Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_ENV"
+      - name: Replace release for this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${version}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --cleanup-tag --yes
+          fi
+          gh release create "$tag" "Zed-aarch64.dmg" \
+            --target "$GITHUB_SHA" \
+            --title "$version" \
+            --latest \
+            --generate-notes
