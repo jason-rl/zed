@@ -15,8 +15,6 @@
 name: Hotfix Review Monitor
 
 on:
-  schedule:
-    - cron: "30 13 * * 1-5" # 1:30 PM UTC weekdays
   workflow_dispatch: {}
 
 permissions:

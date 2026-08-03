@@ -1,11 +1,7 @@
 name: "Label new and reopened blank issues for triage"
 
 on:
-  issues:
-    types:
-      - opened
-      - reopened
-
+  workflow_dispatch: {}
 permissions:
   contents: read
 

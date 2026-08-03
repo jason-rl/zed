@@ -2,9 +2,7 @@
 # Rebuild with `cargo xtask workflows`.
 name: deploy_nightly_docs
 on:
-  push:
-    branches:
-    - main
+  workflow_dispatch: {}
 permissions: {}
 jobs:
   deploy_docs:
