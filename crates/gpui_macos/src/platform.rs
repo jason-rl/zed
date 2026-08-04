@@ -32,8 +32,8 @@ use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
-    WindowParams, popup::PopupNotSupportedError,
+    PlatformWindow, Result, SystemMenuType, SystemSleepPrevention, Task, ThermalState,
+    WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_util::{ResultExt, new_std_command};
 use itertools::Itertools;
@@ -486,6 +486,23 @@ impl Platform for MacPlatform {
 
     fn text_system(&self) -> Arc<dyn PlatformTextSystem> {
         self.0.lock().text_system.clone()
+    }
+
+    fn prevent_system_sleep(&self, reason: &str) -> Option<SystemSleepPrevention> {
+        const NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED: NSUInteger = 1 << 20;
+
+        unsafe {
+            let process_info = NSProcessInfo::processInfo(nil);
+            let token: id = msg_send![process_info,
+                beginActivityWithOptions: NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED
+                reason: ns_string(reason)
+            ];
+            let _: id = msg_send![token, retain];
+            Some(SystemSleepPrevention::new(move || {
+                let _: () = msg_send![process_info, endActivity: token];
+                let _: () = msg_send![token, release];
+            }))
+        }
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {

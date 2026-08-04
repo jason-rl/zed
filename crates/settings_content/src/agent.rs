@@ -198,6 +198,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// Whether to prevent idle system sleep while an agent is actively working.
+    ///
+    /// Default: false
+    pub prevent_system_sleep_when_running: Option<bool>,
     /// Whether to show the agent panel button in the status bar.
     ///
     /// Default: true
