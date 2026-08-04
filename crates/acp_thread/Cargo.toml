@@ -44,6 +44,7 @@ sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+shell_command_parser.workspace = true
 task.workspace = true
 telemetry.workspace = true
 terminal.workspace = true
