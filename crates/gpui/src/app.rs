@@ -51,7 +51,8 @@ use crate::{
     PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
     PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
     ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
+    SystemNotification, SystemNotificationResponse, SystemSleepPrevention, Task, TextRenderingMode,
+    TextSystem,
     ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
     WindowInvalidator,
     colors::{Colors, GlobalColors},
@@ -1292,6 +1293,11 @@ impl App {
     /// Returns the primary display that will be used for new windows.
     pub fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         self.platform.primary_display()
+    }
+
+    /// Prevents idle system sleep until the returned token is dropped, when supported.
+    pub fn prevent_system_sleep(&self, reason: &str) -> Option<SystemSleepPrevention> {
+        self.platform.prevent_system_sleep(reason)
     }
 
     /// Returns whether `screen_capture_sources` may work.

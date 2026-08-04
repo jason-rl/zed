@@ -1059,6 +1059,12 @@
     "entry_primary_click_action": "project_diff",
   },
   "agent": {
+    // Whether to prevent idle system sleep while an agent is actively working.
+    // Display sleep is not prevented. The system may sleep while every running agent is waiting
+    // for user input.
+    //
+    // Default: false
+    "prevent_system_sleep_when_running": false,
     // Whether the inline assistant should use streaming tools, when available
     "inline_assistant_use_streaming_tools": true,
     // Whether to include project rules files (AGENTS.md, CLAUDE.md, .rules, etc.)

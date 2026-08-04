@@ -204,6 +204,7 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
     pub enabled: bool,
+    pub prevent_system_sleep_when_running: bool,
     pub button: bool,
     pub dock: DockPosition,
     pub flexible: bool,
@@ -756,6 +757,7 @@ impl Settings for AgentSettings {
         let agent = content.agent.clone().unwrap();
         Self {
             enabled: agent.enabled.unwrap(),
+            prevent_system_sleep_when_running: agent.prevent_system_sleep_when_running.unwrap(),
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),
             sidebar_side: agent.sidebar_side.unwrap(),
@@ -1060,6 +1062,32 @@ mod tests {
     fn test_invalid_regex_returns_none() {
         let result = CompiledRegex::new("[invalid(regex", false);
         assert!(result.is_none());
+    }
+
+    #[gpui::test]
+    fn test_prevent_system_sleep_when_running_setting(cx: &mut gpui::App) {
+        let settings_store = SettingsStore::test(cx);
+        cx.set_global(settings_store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        assert!(!AgentSettings::get_global(cx).prevent_system_sleep_when_running);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            let settings = store
+                .new_text_for_update("{}".to_string(), |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .prevent_system_sleep_when_running = Some(true);
+                })
+                .expect("test settings update should succeed");
+            store
+                .set_user_settings(&settings, cx)
+                .expect("test settings should be valid");
+        });
+
+        assert!(AgentSettings::get_global(cx).prevent_system_sleep_when_running);
     }
 
     #[gpui::test]

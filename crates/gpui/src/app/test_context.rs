@@ -382,6 +382,11 @@ impl TestAppContext {
         self.test_platform.shown_system_notifications()
     }
 
+    /// Returns the number of active idle system sleep prevention tokens.
+    pub fn system_sleep_prevention_count(&self) -> usize {
+        self.test_platform.system_sleep_prevention_count()
+    }
+
     /// Returns the system notifications currently delivered by the test platform.
     pub fn delivered_system_notifications(&self) -> Vec<SystemNotification> {
         self.test_platform.delivered_system_notifications()
@@ -1288,6 +1293,17 @@ mod tests {
 
         assert!(cx.delivered_system_notifications().is_empty());
         assert_eq!(cx.dismissed_system_notifications(), ["thread-1"]);
+    }
+
+    #[gpui::test]
+    fn test_system_sleep_prevention_token_lifetime(cx: &mut TestAppContext) {
+        assert_eq!(cx.system_sleep_prevention_count(), 0);
+
+        let prevention = cx.update(|cx| cx.prevent_system_sleep("test activity"));
+        assert_eq!(cx.system_sleep_prevention_count(), 1);
+
+        drop(prevention);
+        assert_eq!(cx.system_sleep_prevention_count(), 0);
     }
 
     #[gpui::test]
