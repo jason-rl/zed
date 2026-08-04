@@ -78,6 +78,28 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
+/// Prevents idle system sleep until dropped.
+pub struct SystemSleepPrevention {
+    on_drop: Option<Box<dyn FnOnce()>>,
+}
+
+impl SystemSleepPrevention {
+    /// Creates a system sleep prevention token.
+    pub fn new(on_drop: impl FnOnce() + 'static) -> Self {
+        Self {
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+}
+
+impl Drop for SystemSleepPrevention {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub(crate) use test::*;
 
@@ -127,6 +149,10 @@ pub trait Platform: 'static {
     fn background_executor(&self) -> BackgroundExecutor;
     fn foreground_executor(&self) -> ForegroundExecutor;
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
+
+    fn prevent_system_sleep(&self, _reason: &str) -> Option<SystemSleepPrevention> {
+        None
+    }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
     fn quit(&self);

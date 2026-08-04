@@ -7,8 +7,8 @@ use crate::{
     DummyKeyboardMapper, ForegroundExecutor, Keymap, Platform, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SharedString,
-    SourceMetadata, SystemNotification, SystemNotificationResponse, Task, TestDisplay, TestWindow,
-    ThermalState, WindowAppearance, WindowParams, size,
+    SourceMetadata, SystemNotification, SystemNotificationResponse, SystemSleepPrevention, Task,
+    TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
 };
 use anyhow::Result;
 #[cfg(any(test, feature = "test-support"))]
@@ -16,7 +16,7 @@ use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
@@ -44,6 +44,7 @@ pub(crate) struct TestPlatform {
     pub expect_restart:
         RefCell<Option<oneshot::Sender<(Option<PathBuf>, Vec<std::ffi::OsString>)>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
+    system_sleep_prevention_count: Rc<Cell<usize>>,
     weak: Weak<Self>,
 }
 
@@ -159,7 +160,12 @@ impl TestPlatform {
             system_notifications: Default::default(),
             text_system,
             headless_renderer_factory,
+            system_sleep_prevention_count: Rc::new(Cell::new(0)),
         })
+    }
+
+    pub(crate) fn system_sleep_prevention_count(&self) -> usize {
+        self.system_sleep_prevention_count.get()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -357,6 +363,14 @@ impl Platform for TestPlatform {
 
     fn text_system(&self) -> Arc<dyn PlatformTextSystem> {
         self.text_system.clone()
+    }
+
+    fn prevent_system_sleep(&self, _reason: &str) -> Option<SystemSleepPrevention> {
+        let count = self.system_sleep_prevention_count.clone();
+        count.set(count.get() + 1);
+        Some(SystemSleepPrevention::new(move || {
+            count.set(count.get() - 1);
+        }))
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
