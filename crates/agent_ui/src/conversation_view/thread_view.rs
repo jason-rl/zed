@@ -42,7 +42,7 @@ use language_model::{
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+    ButtonLike, CalloutBorderPosition, Checkbox, Chip, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
@@ -54,6 +54,18 @@ use super::elicitation::{
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+
+fn pragmatic_file_operation_label(kind: acp_thread::PragmaticFileOperationKind) -> &'static str {
+    match kind {
+        acp_thread::PragmaticFileOperationKind::Read => "Read",
+        acp_thread::PragmaticFileOperationKind::Update => "Update",
+        acp_thread::PragmaticFileOperationKind::Write => "Write",
+    }
+}
+
+fn pragmatic_shell_tooltip(command: &str) -> SharedString {
+    command.to_string().into()
+}
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -7931,6 +7943,72 @@ impl ThreadView {
             .child(div().absolute().top_1().right_1().child(copy_button))
     }
 
+    fn render_pragmatic_file_operations(
+        &self,
+        operations: &[acp_thread::PragmaticFileOperation],
+        command: &str,
+        working_dir: Option<&Path>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let command = pragmatic_shell_tooltip(command);
+        v_flex()
+            .py_1()
+            .gap_0p5()
+            .child(
+                h_flex().px_1p5().child(
+                    Chip::new("Shell")
+                        .label_color(Color::Muted)
+                        .tooltip(Tooltip::text(command)),
+                ),
+            )
+            .children(operations.iter().enumerate().map(|(index, operation)| {
+                let kind = operation.kind();
+                let label = pragmatic_file_operation_label(kind);
+                let display_path = working_dir
+                    .and_then(|working_dir| operation.path.strip_prefix(working_dir).ok())
+                    .unwrap_or(&operation.path)
+                    .display()
+                    .to_string();
+                let icon = FileIcons::get_icon(&operation.path, cx)
+                    .map(|path| Icon::from_path(path).color(Color::Muted))
+                    .unwrap_or_else(|| {
+                        Icon::new(match kind {
+                            acp_thread::PragmaticFileOperationKind::Read => IconName::ToolSearch,
+                            acp_thread::PragmaticFileOperationKind::Update
+                            | acp_thread::PragmaticFileOperationKind::Write => IconName::ToolPencil,
+                        })
+                        .color(Color::Muted)
+                    });
+                let path = operation.path.clone();
+                let workspace = self.workspace.clone();
+
+                h_flex()
+                    .id(("pragmatic-file-operation", index))
+                    .gap_1p5()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover.opacity(0.5)))
+                    .child(icon.size(IconSize::Small))
+                    .child(
+                        Label::new(format!("{label} {display_path}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text("Go to File"))
+                    .on_click(move |_event, window, cx| {
+                        if let Some(workspace) = workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                open_abs_path_at_point(workspace, path.clone(), None, window, cx);
+                            });
+                        }
+                        cx.stop_propagation();
+                    })
+            }))
+            .into_any_element()
+    }
+
     fn render_terminal_tool_call(
         &self,
         active_session_id: &acp::SessionId,
@@ -7982,18 +8060,33 @@ impl ThreadView {
         ));
         let border_color = cx.theme().colors().border.opacity(0.6);
 
-        let working_dir = working_dir
+        let working_dir_label = working_dir
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "current directory".to_string());
 
-        let command_element = self.render_collapsible_command(
-            header_group.clone(),
-            false,
-            tool_call.label.clone(),
-            window,
-            cx,
-        );
+        let show_pragmatic_operations =
+            tool_call.pragmatic_file_operations.is_some() && !needs_confirmation;
+        let command_element = if show_pragmatic_operations {
+            self.render_pragmatic_file_operations(
+                tool_call
+                    .pragmatic_file_operations
+                    .as_deref()
+                    .unwrap_or_default(),
+                tool_call.label.read(cx).source(),
+                working_dir.as_deref(),
+                cx,
+            )
+        } else {
+            self.render_collapsible_command(
+                header_group.clone(),
+                false,
+                tool_call.label.clone(),
+                window,
+                cx,
+            )
+            .into_any_element()
+        };
 
         let is_expanded = self
             .entry_view_state
@@ -8024,7 +8117,7 @@ impl ThreadView {
         let header = TerminalToolHeader::new(
             terminal.entity_id().to_string(),
             header_group,
-            working_dir,
+            working_dir_label,
             is_expanded,
         )
         .elapsed(time_elapsed)
@@ -8093,6 +8186,18 @@ impl ThreadView {
                         .rounded_b_md()
                         .text_ui_sm(cx)
                         .h_full()
+                        .when(show_pragmatic_operations, |this| {
+                            this.child(self.render_collapsible_command(
+                                SharedString::from(format!(
+                                    "terminal-tool-expanded-command-{}",
+                                    terminal.entity_id()
+                                )),
+                                false,
+                                tool_call.label.clone(),
+                                window,
+                                cx,
+                            ))
+                        })
                         .children(terminal_view.map(|terminal_view| {
                             let element = if terminal_view
                                 .read(cx)
@@ -12685,8 +12790,31 @@ mod tests {
             subagent_session_info: None,
             sandbox_authorization_details: None,
             sandbox_fallback_authorization_details: None,
+            pragmatic_file_operations: None,
             sandbox_not_applied: None,
         })
+    }
+
+    #[test]
+    fn pragmatic_file_operation_labels_match_display_kinds() {
+        assert_eq!(
+            pragmatic_file_operation_label(acp_thread::PragmaticFileOperationKind::Read),
+            "Read"
+        );
+        assert_eq!(
+            pragmatic_file_operation_label(acp_thread::PragmaticFileOperationKind::Update),
+            "Update"
+        );
+        assert_eq!(
+            pragmatic_file_operation_label(acp_thread::PragmaticFileOperationKind::Write),
+            "Write"
+        );
+    }
+
+    #[test]
+    fn pragmatic_shell_label_tooltip_preserves_original_command() {
+        let command = "printf '%s\\n' \"hello world\" > output.txt";
+        assert_eq!(pragmatic_shell_tooltip(command), command);
     }
 
     #[gpui::test]

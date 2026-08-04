@@ -12,7 +12,7 @@ pub use diff::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{FutureExt, channel::oneshot, future::BoxFuture};
 use gpui::{
-    AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
+    AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task, TaskExt,
     WeakEntity,
 };
 use itertools::Itertools;
@@ -863,6 +863,7 @@ pub struct ToolCall {
     pub subagent_session_info: Option<SubagentSessionInfo>,
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
     pub sandbox_fallback_authorization_details: Option<SandboxFallbackAuthorizationDetails>,
+    pub pragmatic_file_operations: Option<Vec<PragmaticFileOperation>>,
     /// Why this terminal command ran without the OS sandbox even though
     /// sandboxing was active (see [`SANDBOX_NOT_APPLIED_META_KEY`]). `None` when
     /// the command was sandboxed normally (or sandboxing was off).
@@ -878,6 +879,7 @@ impl ToolCall {
         terminals: &HashMap<acp::TerminalId, Entity<Terminal>>,
         cx: &mut App,
     ) -> Result<Self> {
+        let command = tool_call.title.clone();
         let title = if tool_call.kind == acp::ToolKind::Execute {
             tool_call.title
         } else if tool_call.kind == acp::ToolKind::Edit {
@@ -913,6 +915,8 @@ impl ToolCall {
         let sandbox_fallback_authorization_details =
             sandbox_fallback_authorization_details_from_meta(&tool_call.meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&tool_call.meta);
+        let pragmatic_file_operations =
+            pragmatic_file_operations(tool_call.kind, &command, &content, cx);
 
         let label = if tool_call.kind == acp::ToolKind::Execute {
             cx.new(|cx| Markdown::new_text(title.into(), cx))
@@ -935,6 +939,7 @@ impl ToolCall {
             subagent_session_info,
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
+            pragmatic_file_operations,
             sandbox_not_applied,
         };
         Ok(result)
@@ -1166,6 +1171,101 @@ impl ToolCall {
             })
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PragmaticFileOperationKind {
+    Read,
+    Update,
+    Write,
+}
+
+#[derive(Clone, Debug)]
+pub struct PragmaticFileOperation {
+    source_kind: shell_command_parser::ShellFileOperationKind,
+    pub path: PathBuf,
+    existed_before: Option<bool>,
+    exists_after: Option<bool>,
+    before_checked: bool,
+    after_checked: bool,
+}
+
+impl PragmaticFileOperation {
+    fn new(
+        source_kind: shell_command_parser::ShellFileOperationKind,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            source_kind,
+            path: path.into(),
+            existed_before: None,
+            exists_after: None,
+            before_checked: false,
+            after_checked: false,
+        }
+    }
+
+    pub fn kind(&self) -> PragmaticFileOperationKind {
+        match self.source_kind {
+            shell_command_parser::ShellFileOperationKind::Read => PragmaticFileOperationKind::Read,
+            shell_command_parser::ShellFileOperationKind::Update => {
+                PragmaticFileOperationKind::Update
+            }
+            shell_command_parser::ShellFileOperationKind::Write => {
+                PragmaticFileOperationKind::Write
+            }
+            shell_command_parser::ShellFileOperationKind::Append => {
+                if self.existed_before == Some(false) && self.exists_after == Some(true) {
+                    PragmaticFileOperationKind::Write
+                } else {
+                    PragmaticFileOperationKind::Update
+                }
+            }
+        }
+    }
+}
+
+fn pragmatic_file_operations(
+    kind: acp::ToolKind,
+    command: &str,
+    content: &[ToolCallContent],
+    cx: &App,
+) -> Option<Vec<PragmaticFileOperation>> {
+    if kind != acp::ToolKind::Execute {
+        return None;
+    }
+    let working_dir = content.iter().find_map(|content| match content {
+        ToolCallContent::Terminal(terminal) => terminal.read(cx).working_dir().clone(),
+        ToolCallContent::ContentBlock(_) | ToolCallContent::Diff(_) => None,
+    });
+    shell_command_parser::extract_file_operations(command).and_then(|operations| {
+        let operations: Vec<_> = operations
+            .into_iter()
+            .map(|operation| {
+                let path = if operation.path.is_absolute() {
+                    operation.path
+                } else {
+                    working_dir.as_ref()?.join(operation.path)
+                };
+                let path = util::paths::normalize_lexically(&path).ok()?;
+                Some(PragmaticFileOperation::new(operation.kind, path))
+            })
+            .collect::<Option<_>>()?;
+        let mut paths = HashSet::default();
+        operations
+            .iter()
+            .all(|operation| paths.insert(operation.path.clone()))
+            .then_some(operations)
+    })
+}
+
+fn ensure_pragmatic_file_operations(tool_call: &mut ToolCall, cx: &App) {
+    if tool_call.pragmatic_file_operations.is_some() {
+        return;
+    }
+    let command = tool_call.label.read(cx).source().to_string();
+    tool_call.pragmatic_file_operations =
+        pragmatic_file_operations(tool_call.kind, &command, &tool_call.content, cx);
 }
 
 // Separate so we can hold a strong reference to the buffer
@@ -3134,6 +3234,7 @@ impl AcpThread {
                     subagent_session_info: None,
                     sandbox_authorization_details: None,
                     sandbox_fallback_authorization_details: None,
+                    pragmatic_file_operations: None,
                     sandbox_not_applied: None,
                 };
                 self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
@@ -3144,6 +3245,7 @@ impl AcpThread {
             unreachable!()
         };
 
+        let mut updated_location_id = None;
         match update {
             ToolCallUpdate::UpdateFields(update) => {
                 let location_updated = update.fields.locations.is_some();
@@ -3156,7 +3258,7 @@ impl AcpThread {
                     cx,
                 )?;
                 if location_updated {
-                    self.resolve_locations(update.tool_call_id, cx);
+                    updated_location_id = Some(update.tool_call_id);
                 }
             }
             ToolCallUpdate::UpdateDiff(update) => {
@@ -3170,7 +3272,22 @@ impl AcpThread {
             }
         }
 
+        ensure_pragmatic_file_operations(call, cx);
+
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
+
+        let id = call.id.clone();
+        let is_finished = matches!(
+            call.status,
+            ToolCallStatus::Completed | ToolCallStatus::Failed
+        );
+        if let Some(location_id) = updated_location_id {
+            self.resolve_locations(location_id, cx);
+        }
+        self.inspect_append_file_operations(id.clone(), false, cx);
+        if is_finished {
+            self.inspect_append_file_operations(id, true, cx);
+        }
 
         Ok(())
     }
@@ -3195,6 +3312,7 @@ impl AcpThread {
         let language_registry = self.project.read(cx).languages().clone();
         let path_style = self.project.read(cx).path_style(cx);
         let id = update.tool_call_id.clone();
+        let is_finished = matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed);
 
         let agent_telemetry_id = self.connection().telemetry_id();
         let session = self.session_id();
@@ -3228,6 +3346,7 @@ impl AcpThread {
                 cx,
             )?;
             call.update_status(status);
+            ensure_pragmatic_file_operations(call, cx);
 
             cx.emit(AcpThreadEvent::EntryUpdated(ix));
         } else {
@@ -3242,8 +3361,84 @@ impl AcpThread {
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
         };
 
-        self.resolve_locations(id, cx);
+        self.resolve_locations(id.clone(), cx);
+        self.inspect_append_file_operations(id.clone(), false, cx);
+        if is_finished {
+            self.inspect_append_file_operations(id, true, cx);
+        }
         Ok(())
+    }
+
+    fn inspect_append_file_operations(
+        &mut self,
+        id: acp::ToolCallId,
+        after_execution: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_entry_index, tool_call)) = self.tool_call_mut(&id) else {
+            return;
+        };
+        let Some(operations) = tool_call.pragmatic_file_operations.as_mut() else {
+            return;
+        };
+
+        let mut paths = Vec::new();
+        for (operation_index, operation) in operations.iter_mut().enumerate() {
+            if operation.source_kind != shell_command_parser::ShellFileOperationKind::Append {
+                continue;
+            }
+            let checked = if after_execution {
+                &mut operation.after_checked
+            } else {
+                &mut operation.before_checked
+            };
+            if *checked {
+                continue;
+            }
+            *checked = true;
+            paths.push((operation_index, operation.path.clone()));
+        }
+        if paths.is_empty() {
+            return;
+        }
+
+        let fs = self.project.read(cx).fs().clone();
+        cx.spawn(async move |this, cx| {
+            let mut results = Vec::with_capacity(paths.len());
+            for (operation_index, path) in paths {
+                let exists = fs
+                    .metadata(&path)
+                    .await
+                    .log_err()
+                    .map(|metadata| metadata.is_some());
+                results.push((operation_index, path, exists));
+            }
+
+            this.update(cx, |this, cx| {
+                let Some((entry_index, tool_call)) = this.tool_call_mut(&id) else {
+                    return;
+                };
+                let Some(operations) = tool_call.pragmatic_file_operations.as_mut() else {
+                    return;
+                };
+                for (operation_index, path, exists) in results {
+                    let Some(operation) = operations.get_mut(operation_index) else {
+                        continue;
+                    };
+                    if operation.path != path {
+                        continue;
+                    }
+                    if after_execution {
+                        operation.exists_after = exists;
+                    } else {
+                        operation.existed_before = exists;
+                    }
+                }
+                cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn index_for_tool_call(&self, id: &acp::ToolCallId) -> Option<usize> {
@@ -4753,6 +4948,43 @@ mod tests {
         time::Duration,
     };
     use util::{path, path_list::PathList};
+
+    #[test]
+    fn pragmatic_append_operation_becomes_write_only_when_created() {
+        let mut operation = PragmaticFileOperation::new(
+            shell_command_parser::ShellFileOperationKind::Append,
+            PathBuf::from("/project/log.txt"),
+        );
+        assert_eq!(operation.kind(), PragmaticFileOperationKind::Update);
+
+        operation.existed_before = Some(false);
+        operation.exists_after = Some(true);
+        assert_eq!(operation.kind(), PragmaticFileOperationKind::Write);
+
+        operation.exists_after = Some(false);
+        assert_eq!(operation.kind(), PragmaticFileOperationKind::Update);
+    }
+
+    #[test]
+    fn pragmatic_non_append_operations_have_stable_kinds() {
+        for (source_kind, display_kind) in [
+            (
+                shell_command_parser::ShellFileOperationKind::Read,
+                PragmaticFileOperationKind::Read,
+            ),
+            (
+                shell_command_parser::ShellFileOperationKind::Update,
+                PragmaticFileOperationKind::Update,
+            ),
+            (
+                shell_command_parser::ShellFileOperationKind::Write,
+                PragmaticFileOperationKind::Write,
+            ),
+        ] {
+            let operation = PragmaticFileOperation::new(source_kind, "/project/file.txt");
+            assert_eq!(operation.kind(), display_kind);
+        }
+    }
 
     #[test]
     fn command_category_meta_round_trips() {
