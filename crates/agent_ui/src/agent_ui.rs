@@ -24,6 +24,7 @@ mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+mod system_sleep;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
@@ -588,6 +589,7 @@ pub fn init(
 ) {
     agent::ThreadStore::init_global(cx);
     prompt_store::init(cx);
+    system_sleep::init(cx);
 
     cx.set_global(agent_skills::SkillsUpdatedHook(std::rc::Rc::new(|cx| {
         let workspaces: Vec<_> = workspace::AppState::global(cx)
@@ -972,6 +974,7 @@ mod tests {
 
         let agent_settings = AgentSettings {
             enabled: true,
+            prevent_system_sleep_when_running: false,
             button: true,
             dock: DockPosition::Right,
             flexible: true,

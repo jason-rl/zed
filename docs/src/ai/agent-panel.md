@@ -111,6 +111,8 @@ If you send a prompt to the Agent and then put Zed in the background, you can ch
 
 These notifications can be used together or individually, and you can use the `agent.notify_when_agent_waiting` and `agent.play_sound_when_agent_done` settings keys to customize that, including turning both off entirely.
 
+On macOS, set `agent.prevent_system_sleep_when_running` to `true` to prevent idle system sleep while at least one Agent is actively working. Display sleep is still allowed, and system sleep is allowed whenever every running Agent is waiting for user input.
+
 ### Reviewing Changes {#reviewing-changes}
 
 Once the agent has made changes to your project, the panel will surface which files, how many of them, and how many lines have been edited.
