@@ -127,6 +127,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "shell_command_parser",
  "task",
  "telemetry",
  "tempfile",
