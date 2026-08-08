@@ -1,9 +1,15 @@
-use std::{cell::Cell, ops::Range, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+};
 
 use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
+use buffer_diff::DiffHunkStatusKind;
 use collections::{HashMap, HashSet};
 use editor::{
     Editor, EditorEvent, EditorMode, MinimapVisibility, RestoreOnlyUnstagedDiffHunkDelegate,
@@ -14,6 +20,7 @@ use gpui::{
     ScrollHandle, TextStyleRefinement, WeakEntity, Window,
 };
 use language::language_settings::SoftWrap;
+use multi_buffer::{Anchor, MultiBufferRow, MultiBufferSnapshot};
 use project::{AgentId, Project, project_settings::DiagnosticSeverity};
 use rope::Point;
 use settings::{Settings as _, ThinkingBlockDisplay};
@@ -23,6 +30,11 @@ use ui::{Context, TextSize};
 use workspace::Workspace;
 
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
+
+const DELETION_FOLD_THRESHOLD: u32 = 8;
+const DELETION_FOLD_CONTEXT_LINES: u32 = 3;
+const MAX_ADDED_LINES_IN_FOLDED_REPLACEMENT: u32 = 3;
+const MIN_DELETION_TO_ADDITION_RATIO: u32 = 4;
 
 /// Maps an entry index through the removal of `removed` (a contiguous range of
 /// entries), returning `None` if the index referred to a removed entry.
@@ -759,6 +771,8 @@ fn create_editor_diff(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<Editor> {
+    let multibuffer = diff.read(cx).multibuffer().clone();
+    let managed_fold_ranges = Rc::new(RefCell::new(Vec::new()));
     cx.new(|cx| {
         let mut editor = Editor::new(
             EditorMode::Full {
@@ -766,7 +780,7 @@ fn create_editor_diff(
                 show_active_line_background: false,
                 sizing_behavior: SizingBehavior::SizeByContent,
             },
-            diff.read(cx).multibuffer().clone(),
+            multibuffer.clone(),
             None,
             window,
             cx,
@@ -789,8 +803,92 @@ fn create_editor_diff(
         editor.set_expand_all_diff_hunks(cx);
         editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyUnstagedDiffHunkDelegate)), cx);
         editor.set_text_style_refinement(diff_editor_text_style_refinement(cx));
+
+        refresh_deletion_heavy_hunk_folds(&mut editor, &managed_fold_ranges, window, cx);
+        cx.observe_in(&multibuffer, window, {
+            let managed_fold_ranges = managed_fold_ranges.clone();
+            move |editor, _, window, cx| {
+                refresh_deletion_heavy_hunk_folds(editor, &managed_fold_ranges, window, cx)
+            }
+        })
+        .detach();
         editor
     })
+}
+
+fn refresh_deletion_heavy_hunk_folds(
+    editor: &mut Editor,
+    managed_fold_ranges: &RefCell<Vec<Range<Anchor>>>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let desired_fold_ranges = {
+        let multibuffer = editor.buffer().read(cx);
+        deletion_heavy_hunk_fold_ranges(&multibuffer.snapshot(cx))
+    };
+    let mut managed_fold_ranges = managed_fold_ranges.borrow_mut();
+
+    for range in managed_fold_ranges
+        .iter()
+        .filter(|range| !desired_fold_ranges.contains(range))
+    {
+        editor.unfold_ranges(std::slice::from_ref(range), true, false, cx);
+    }
+
+    for range in desired_fold_ranges
+        .iter()
+        .filter(|range| !managed_fold_ranges.contains(range))
+    {
+        editor.fold_ranges(vec![range.clone()], false, window, cx);
+    }
+
+    *managed_fold_ranges = desired_fold_ranges;
+}
+
+fn deletion_heavy_hunk_fold_ranges(snapshot: &MultiBufferSnapshot) -> Vec<Range<Anchor>> {
+    snapshot
+        .diff_hunks()
+        .filter_map(|hunk| {
+            let mut deleted_row_range = None::<Range<u32>>;
+            let mut added_line_count = 0;
+
+            for (row, row_info) in snapshot
+                .row_infos(hunk.row_range.start)
+                .take((hunk.row_range.end.0 - hunk.row_range.start.0) as usize)
+                .enumerate()
+            {
+                let row = hunk.row_range.start.0 + row as u32;
+                match row_info.diff_status.map(|status| status.kind) {
+                    Some(DiffHunkStatusKind::Deleted) => match &mut deleted_row_range {
+                        Some(range) if range.end == row => range.end += 1,
+                        None => deleted_row_range = Some(row..row + 1),
+                        Some(_) => return None,
+                    },
+                    Some(DiffHunkStatusKind::Added) => added_line_count += 1,
+                    _ => {}
+                }
+            }
+
+            let deleted_row_range = deleted_row_range?;
+            let deleted_line_count = deleted_row_range.end - deleted_row_range.start;
+            if deleted_line_count < DELETION_FOLD_THRESHOLD
+                || added_line_count > MAX_ADDED_LINES_IN_FOLDED_REPLACEMENT
+                || added_line_count.saturating_mul(MIN_DELETION_TO_ADDITION_RATIO)
+                    > deleted_line_count
+            {
+                return None;
+            }
+
+            let first_hidden_row = deleted_row_range.start + DELETION_FOLD_CONTEXT_LINES;
+            let last_hidden_row = deleted_row_range.end - DELETION_FOLD_CONTEXT_LINES - 1;
+            let start = Point::new(first_hidden_row, 0);
+            let end = Point::new(
+                last_hidden_row,
+                snapshot.line_len(MultiBufferRow(last_hidden_row)),
+            );
+            Some(snapshot.anchor_before(start)..snapshot.anchor_after(end))
+        })
+        .collect()
 }
 
 fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
@@ -814,20 +912,102 @@ mod tests {
     use acp_thread::{AgentConnection, StubAgentConnection};
     use agent_client_protocol::schema::v1 as acp;
     use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
-    use editor::RowInfo;
+    use editor::{Editor, RowInfo};
     use fs::FakeFs;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use parking_lot::RwLock;
 
     use crate::entry_view_state::{Entry, EntryViewState};
     use crate::message_editor::SessionCapabilities;
-    use multi_buffer::MultiBufferRow;
+    use multi_buffer::{Anchor, MultiBufferRow};
     use pretty_assertions::assert_matches;
     use project::Project;
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
     use workspace::{MultiWorkspace, PathList};
+
+    async fn diff_editors_for_texts(
+        cases: &[(&str, &str)],
+        cx: &mut TestAppContext,
+    ) -> Vec<Entity<Editor>> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/project"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
+
+        for (index, (old_text, new_text)) in cases.iter().enumerate() {
+            let tool_call = acp::ToolCall::new(format!("tool-{index}"), "Tool call")
+                .status(acp::ToolCallStatus::Completed)
+                .content(vec![acp::ToolCallContent::Diff(
+                    acp::Diff::new(format!("/project/file-{index}.txt"), *new_text)
+                        .old_text(*old_text),
+                )]);
+            cx.update(|_, cx| {
+                connection.send_update(
+                    session_id.clone(),
+                    acp::SessionUpdate::ToolCall(tool_call),
+                    cx,
+                )
+            });
+        }
+
+        let view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+        view_state.update_in(cx, |view_state, window, cx| {
+            for index in 0..cases.len() {
+                view_state.sync_entry(index, &thread, window, cx);
+            }
+        });
+
+        let diffs = thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .map(|entry| entry.diffs().next().unwrap().clone())
+                .collect::<Vec<_>>()
+        });
+        cx.run_until_parked();
+
+        view_state.read_with(cx, |view_state, _| {
+            diffs
+                .iter()
+                .enumerate()
+                .map(|(index, diff)| {
+                    view_state
+                        .entry(index)
+                        .unwrap()
+                        .editor_for_diff(diff)
+                        .unwrap()
+                })
+                .collect()
+        })
+    }
 
     #[test]
     fn test_terminal_output_line_count() {
@@ -959,6 +1139,123 @@ mod tests {
                     ..
                 }
             ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_long_deleted_hunk_is_folded(cx: &mut TestAppContext) {
+        let old_text = "before\ndeleted 1\ndeleted 2\ndeleted 3\ndeleted 4\ndeleted 5\ndeleted 6\ndeleted 7\ndeleted 8\nafter";
+        let new_text = "before\nafter";
+        let editor = diff_editors_for_texts(&[(old_text, new_text)], cx)
+            .await
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.display_text(cx)),
+            "before\ndeleted 1\ndeleted 2\ndeleted 3\n⋯\ndeleted 6\ndeleted 7\ndeleted 8\nafter"
+        );
+
+        editor.update(cx, |editor, cx| {
+            editor.unfold_ranges(&[Anchor::Min..Anchor::Max], true, false, cx)
+        });
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.display_text(cx)),
+            old_text
+        );
+    }
+
+    #[gpui::test]
+    async fn test_short_deleted_hunk_is_not_folded(cx: &mut TestAppContext) {
+        let old_text = "before\ndeleted 1\ndeleted 2\ndeleted 3\ndeleted 4\ndeleted 5\ndeleted 6\ndeleted 7\nafter";
+        let new_text = "before\nafter";
+        let editor = diff_editors_for_texts(&[(old_text, new_text)], cx)
+            .await
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.display_text(cx)),
+            old_text
+        );
+    }
+
+    #[gpui::test]
+    async fn test_deletion_heavy_replacement_hunk_is_folded(cx: &mut TestAppContext) {
+        let old_text = "before\nold 1\nold 2\nold 3\nold 4\nold 5\nold 6\nold 7\nold 8\nold 9\nold 10\nold 11\nold 12\nafter";
+        let new_text = "before\nnew 1\nnew 2\nnew 3\nafter";
+        let editor = diff_editors_for_texts(&[(old_text, new_text)], cx)
+            .await
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.display_text(cx)),
+            "before\nold 1\nold 2\nold 3\n⋯\nold 10\nold 11\nold 12\nnew 1\nnew 2\nnew 3\nafter"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_dense_replacement_hunk_is_not_folded(cx: &mut TestAppContext) {
+        let old_text = format!(
+            "before\n{}\nafter",
+            (1..=20)
+                .map(|line| format!("old {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let new_text = format!(
+            "before\n{}\nafter",
+            (1..=20)
+                .map(|line| format!("new {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let editor = diff_editors_for_texts(&[(&old_text, &new_text)], cx)
+            .await
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.display_text(cx)),
+            format!(
+                "before\n{}\n{}\nafter",
+                (1..=20)
+                    .map(|line| format!("old {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                (1..=20)
+                    .map(|line| format!("new {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_replacement_with_many_added_lines_is_not_folded(cx: &mut TestAppContext) {
+        let old_text = format!(
+            "before\n{}\nafter",
+            (1..=20)
+                .map(|line| format!("old {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let new_text = "before\nnew 1\nnew 2\nnew 3\nnew 4\nafter";
+        let editor = diff_editors_for_texts(&[(&old_text, new_text)], cx)
+            .await
+            .pop()
+            .unwrap();
+
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.display_text(cx)),
+            format!(
+                "before\n{}\nnew 1\nnew 2\nnew 3\nnew 4\nafter",
+                (1..=20)
+                    .map(|line| format!("old {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         );
     }
 
