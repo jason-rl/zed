@@ -3451,6 +3451,8 @@ async fn test_truncate_first_message(cx: &mut TestAppContext) {
                 max_output_tokens: None,
                 input_tokens: 32_000,
                 output_tokens: 16_000,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
             })
         );
     });
@@ -3513,6 +3515,8 @@ async fn test_truncate_first_message(cx: &mut TestAppContext) {
                 max_output_tokens: None,
                 input_tokens: 40_000,
                 output_tokens: 20_000,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
             })
         );
     });
@@ -3552,6 +3556,8 @@ async fn test_latest_token_usage_counts_cached_input_tokens(cx: &mut TestAppCont
                 max_output_tokens: None,
                 input_tokens: 200,
                 output_tokens: 50,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
             })
         );
     });
@@ -3837,6 +3843,8 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
                     max_output_tokens: None,
                     input_tokens: 32_000,
                     output_tokens: 16_000,
+                    cached_read_tokens: None,
+                    cached_write_tokens: None,
                 })
             );
         });
@@ -3894,6 +3902,8 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
                 max_output_tokens: None,
                 input_tokens: 40_000,
                 output_tokens: 20_000,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
             })
         );
     });
