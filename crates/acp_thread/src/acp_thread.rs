@@ -2117,6 +2117,10 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -4065,6 +4069,8 @@ impl AcpThread {
                             let usage = this.token_usage.get_or_insert_with(Default::default);
                             usage.input_tokens = response_usage.input_tokens;
                             usage.output_tokens = response_usage.output_tokens;
+                            usage.cached_read_tokens = response_usage.cached_read_tokens;
+                            usage.cached_write_tokens = response_usage.cached_write_tokens;
                             cx.emit(AcpThreadEvent::TokenUsageUpdated);
                         }
 
@@ -10296,8 +10302,11 @@ mod tests {
                             )
                             .unwrap();
                     })?;
-                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)
-                        .usage(acp::Usage::new(500, 200, 300)))
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn).usage(
+                        acp::Usage::new(500, 200, 300)
+                            .cached_read_tokens(120)
+                            .cached_write_tokens(80),
+                    ))
                 }
                 .boxed_local()
             },
@@ -10324,10 +10333,87 @@ mod tests {
                 usage.output_tokens, 300,
                 "output_tokens from response usage"
             );
+            assert_eq!(
+                usage.cached_read_tokens,
+                Some(120),
+                "cached_read_tokens from response usage"
+            );
+            assert_eq!(
+                usage.cached_write_tokens,
+                Some(80),
+                "cached_write_tokens from response usage"
+            );
 
             let cost = thread.cost().expect("cost should be set");
             assert!((cost.amount - 0.05).abs() < f64::EPSILON);
             assert_eq!(cost.currency.as_ref(), "EUR");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_response_usage_replaces_reported_cache_totals(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let response_count = Arc::new(AtomicUsize::new(0));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let response_count = response_count.clone();
+            move |_, _, _| {
+                let response_count = response_count.clone();
+                async move {
+                    let response = match response_count.fetch_add(1, SeqCst) {
+                        0 => acp::PromptResponse::new(acp::StopReason::EndTurn).usage(
+                            acp::Usage::new(500, 200, 300)
+                                .cached_read_tokens(120)
+                                .cached_write_tokens(80),
+                        ),
+                        1 => acp::PromptResponse::new(acp::StopReason::EndTurn),
+                        _ => acp::PromptResponse::new(acp::StopReason::EndTurn)
+                            .usage(acp::Usage::new(750, 400, 350)),
+                    };
+                    Ok(response)
+                }
+                .boxed_local()
+            }
+        }));
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("first", cx))
+            .await
+            .unwrap();
+        thread.read_with(cx, |thread, _| {
+            let usage = thread.token_usage().expect("token_usage should be set");
+            assert_eq!(usage.cached_read_tokens, Some(120));
+            assert_eq!(usage.cached_write_tokens, Some(80));
+        });
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("second", cx))
+            .await
+            .unwrap();
+        thread.read_with(cx, |thread, _| {
+            let usage = thread
+                .token_usage()
+                .expect("token_usage should be preserved");
+            assert_eq!(usage.cached_read_tokens, Some(120));
+            assert_eq!(usage.cached_write_tokens, Some(80));
+        });
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("third", cx))
+            .await
+            .unwrap();
+        thread.read_with(cx, |thread, _| {
+            let usage = thread.token_usage().expect("token_usage should be set");
+            assert_eq!(usage.cached_read_tokens, None);
+            assert_eq!(usage.cached_write_tokens, None);
         });
     }
 
