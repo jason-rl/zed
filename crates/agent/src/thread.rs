@@ -2421,6 +2421,8 @@ impl Thread {
             used_tokens: usage.total_tokens(),
             input_tokens,
             output_tokens: usage.output_tokens,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
         })
     }
 

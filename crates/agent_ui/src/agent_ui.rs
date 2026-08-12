@@ -562,7 +562,7 @@ pub(crate) fn humanize_token_count(count: u64) -> String {
                 format!("{}.{}k", thousands, hundreds)
             }
         }
-        10_000..=999_999 => format!("{}k", (count + 500) / 1000),
+        10_000..=999_999 => format!("{}k", count / 1000 + u64::from(count % 1000 >= 500)),
         1_000_000..=9_999_999 => {
             let millions = count / 1_000_000;
             let hundred_thousands = (count % 1_000_000 + 50_000) / 100_000;
@@ -574,7 +574,10 @@ pub(crate) fn humanize_token_count(count: u64) -> String {
                 format!("{}.{}M", millions, hundred_thousands)
             }
         }
-        10_000_000.. => format!("{}M", (count + 500_000) / 1_000_000),
+        10_000_000.. => format!(
+            "{}M",
+            count / 1_000_000 + u64::from(count % 1_000_000 >= 500_000)
+        ),
     }
 }
 
@@ -961,6 +964,11 @@ mod tests {
     use settings::{
         DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings, SettingsStore,
     };
+
+    #[test]
+    fn humanize_token_count_handles_maximum_count() {
+        assert_eq!(humanize_token_count(u64::MAX), "18446744073710M");
+    }
 
     #[gpui::test]
     fn test_agent_command_palette_visibility(cx: &mut TestAppContext) {

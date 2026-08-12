@@ -4785,6 +4785,7 @@ impl ThreadView {
         let thread = self.thread.read(cx);
         let usage = thread.token_usage()?;
         let show_split = self.supports_split_token_display(cx);
+        let prompt_cache_labels = prompt_cache_labels(usage);
 
         let cost_label = thread.cost().map(|cost| {
             let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
@@ -4863,6 +4864,7 @@ impl ThreadView {
                 let project_entry_ids = project_entry_ids.clone();
                 let workspace = workspace.clone();
                 let cost_label = cost_label.clone();
+                let prompt_cache_labels = prompt_cache_labels.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
                     percentage,
                     used,
@@ -4872,6 +4874,7 @@ impl ThreadView {
                     input_max: input_max_label,
                     output_max: output_max_label,
                     show_split,
+                    prompt_cache_labels,
                     cost_label,
                     separator_color: tooltip_separator_color,
                     global_agents_md_loaded,
@@ -5808,6 +5811,45 @@ impl ThreadView {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptCacheLabels {
+    percentage: Option<String>,
+    cached_tokens: Option<String>,
+    total_input_tokens: Option<String>,
+    written_tokens: Option<String>,
+}
+
+fn prompt_cache_labels(usage: &acp_thread::TokenUsage) -> Option<PromptCacheLabels> {
+    if usage.cached_read_tokens.is_none() && usage.cached_write_tokens.is_none() {
+        return None;
+    }
+
+    let written_tokens = usage.cached_write_tokens.map(crate::humanize_token_count);
+    let (percentage, cached_tokens, total_input_tokens) =
+        if let Some(cached_read_tokens) = usage.cached_read_tokens {
+            let total_input_tokens = usage.input_tokens;
+            let percentage = if total_input_tokens == 0 {
+                0
+            } else {
+                (cached_read_tokens as f64 / total_input_tokens as f64 * 100.0).round() as u32
+            };
+            (
+                Some(format!("{}%", percentage)),
+                Some(crate::humanize_token_count(cached_read_tokens)),
+                Some(crate::humanize_token_count(total_input_tokens)),
+            )
+        } else {
+            (None, None, None)
+        };
+
+    Some(PromptCacheLabels {
+        percentage,
+        cached_tokens,
+        total_input_tokens,
+        written_tokens,
+    })
+}
+
 struct TokenUsageTooltip {
     percentage: String,
     used: String,
@@ -5817,6 +5859,7 @@ struct TokenUsageTooltip {
     input_max: String,
     output_max: String,
     show_split: bool,
+    prompt_cache_labels: Option<PromptCacheLabels>,
     cost_label: Option<String>,
     separator_color: Color,
     global_agents_md_loaded: bool,
@@ -5836,6 +5879,7 @@ impl Render for TokenUsageTooltip {
         let input_max = self.input_max.clone();
         let output_max = self.output_max.clone();
         let show_split = self.show_split;
+        let prompt_cache_labels = self.prompt_cache_labels.clone();
         let cost_label = self.cost_label.clone();
         let global_agents_md_loaded = self.global_agents_md_loaded;
         let project_rules_count = self.project_rules_count;
@@ -5880,6 +5924,65 @@ impl Render for TokenUsageTooltip {
                                     .child(Label::new(output_tokens))
                                     .child(Label::new("/").color(separator_color))
                                     .child(Label::new(output_max).color(Color::Muted)),
+                            ),
+                    )
+                })
+                .when_some(prompt_cache_labels, |this, prompt_cache_labels| {
+                    let cached_labels = prompt_cache_labels
+                        .percentage
+                        .zip(prompt_cache_labels.cached_tokens)
+                        .zip(prompt_cache_labels.total_input_tokens)
+                        .map(|((percentage, cached_tokens), total_input_tokens)| {
+                            (percentage, cached_tokens, total_input_tokens)
+                        });
+                    this.child(
+                        v_flex()
+                            .mt_1p5()
+                            .pt_1p5()
+                            .gap_0p5()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new("Prompt cache")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .when_some(
+                                cached_labels,
+                                |this, (percentage, cached_tokens, total_input_tokens)| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                Label::new("Cached:").color(Color::Muted).mr_0p5(),
+                                            )
+                                            .child(Label::new(percentage))
+                                            .child(
+                                                Label::new("\u{2022}")
+                                                    .color(separator_color)
+                                                    .mx_1(),
+                                            )
+                                            .child(Label::new(cached_tokens))
+                                            .child(Label::new("/").color(separator_color))
+                                            .child(
+                                                Label::new(total_input_tokens).color(Color::Muted),
+                                            )
+                                            .child(Label::new("input").color(Color::Muted)),
+                                    )
+                                },
+                            )
+                            .when_some(
+                                prompt_cache_labels.written_tokens,
+                                |this, written_tokens| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                Label::new("Written:").color(Color::Muted).mr_0p5(),
+                                            )
+                                            .child(Label::new(written_tokens)),
+                                    )
+                                },
                             ),
                     )
                 })
@@ -13029,6 +13132,71 @@ mod tests {
     fn pragmatic_shell_label_tooltip_preserves_original_command() {
         let command = "printf '%s\\n' \"hello world\" > output.txt";
         assert_eq!(pragmatic_shell_tooltip(command), command);
+    }
+
+    #[test]
+    fn prompt_cache_labels_format_reported_usage() {
+        assert_eq!(
+            prompt_cache_labels(&acp_thread::TokenUsage::default()),
+            None
+        );
+
+        assert_eq!(
+            prompt_cache_labels(&acp_thread::TokenUsage {
+                input_tokens: 2_000,
+                cached_read_tokens: Some(1_500),
+                ..Default::default()
+            }),
+            Some(PromptCacheLabels {
+                percentage: Some("75%".into()),
+                cached_tokens: Some("1.5k".into()),
+                total_input_tokens: Some("2k".into()),
+                written_tokens: None,
+            })
+        );
+
+        assert_eq!(
+            prompt_cache_labels(&acp_thread::TokenUsage {
+                input_tokens: 1_000,
+                cached_read_tokens: Some(0),
+                ..Default::default()
+            }),
+            Some(PromptCacheLabels {
+                percentage: Some("0%".into()),
+                cached_tokens: Some("0".into()),
+                total_input_tokens: Some("1k".into()),
+                written_tokens: None,
+            })
+        );
+
+        assert_eq!(
+            prompt_cache_labels(&acp_thread::TokenUsage {
+                input_tokens: 1_500,
+                cached_write_tokens: Some(500),
+                ..Default::default()
+            }),
+            Some(PromptCacheLabels {
+                percentage: None,
+                cached_tokens: None,
+                total_input_tokens: None,
+                written_tokens: Some("500".into()),
+            })
+        );
+
+        assert_eq!(
+            prompt_cache_labels(&acp_thread::TokenUsage {
+                input_tokens: u64::MAX,
+                cached_read_tokens: Some(u64::MAX),
+                cached_write_tokens: Some(1),
+                ..Default::default()
+            }),
+            Some(PromptCacheLabels {
+                percentage: Some("100%".into()),
+                cached_tokens: Some("18446744073710M".into()),
+                total_input_tokens: Some("18446744073710M".into()),
+                written_tokens: Some("1".into()),
+            })
+        );
     }
 
     #[gpui::test]
