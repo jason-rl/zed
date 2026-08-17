@@ -37,7 +37,7 @@ use util::process::Child;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
 
-use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
+use acp_thread::{AcpThread, AcpThreadEvent, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
@@ -1256,10 +1256,6 @@ impl AcpConnection {
                     let (modes, config_options) =
                         config_state(response.modes, response.config_options);
 
-                    if let Some(config_opts) = config_options.as_ref() {
-                        this.apply_default_config_options(&session_id, config_opts, cx);
-                    }
-
                     let ref_count = this
                         .pending_sessions
                         .borrow_mut()
@@ -2037,6 +2033,7 @@ impl AgentConnection for AcpConnection {
                 connection: self.connection.clone(),
                 session_id: session_id.clone(),
                 state: modes.clone(),
+                thread: session.thread.clone(),
             }) as _)
         } else {
             None
@@ -2059,6 +2056,7 @@ impl AgentConnection for AcpConnection {
             state: config_opts.config_options.clone(),
             watch_tx: config_opts.tx.clone(),
             watch_rx: config_opts.rx.clone(),
+            thread: session.thread.clone(),
         }) as _)
     }
 
@@ -3651,6 +3649,140 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn loaded_sessions_preserve_agent_config_options(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let (connection, set_config_requests) = connect_config_defaults_test_agent(cx).await;
+        connection.defaults.set(
+            None,
+            HashMap::from_iter([("mode".to_string(), AgentConfigOptionValue::from("default"))]),
+        );
+        let connection = Rc::new(connection);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let session_id = acp::SessionId::new("restored-session");
+        let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
+        let restored_options = vec![acp::SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "plan",
+            vec![
+                acp::SessionConfigSelectOption::new("default", "Default"),
+                acp::SessionConfigSelectOption::new("plan", "Plan"),
+            ],
+        )];
+
+        cx.update(|cx| {
+            connection.clone().open_or_create_session(
+                session_id.clone(),
+                project,
+                work_dirs,
+                None,
+                move |_connection, _session_id, _directories| {
+                    Box::pin(async move {
+                        Ok(SessionConfigResponse {
+                            modes: None,
+                            config_options: Some(restored_options),
+                        })
+                    })
+                },
+                cx,
+            )
+        })
+        .await
+        .expect("loading the session should succeed");
+        cx.run_until_parked();
+
+        assert!(
+            set_config_requests
+                .lock()
+                .expect("set config requests mutex poisoned")
+                .is_empty(),
+            "loading a session must not replace its restored config options with global defaults"
+        );
+        let config_options = cx
+            .update(|cx| connection.session_config_options(&session_id, cx))
+            .expect("loaded session should expose config options")
+            .config_options();
+        assert!(matches!(
+            &config_options[0].kind,
+            acp::SessionConfigKind::Select(select) if select.current_value.0.as_ref() == "plan"
+        ));
+    }
+
+    #[gpui::test]
+    async fn setting_session_config_option_emits_thread_event(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let (connection, _set_config_requests) = connect_config_defaults_test_agent(cx).await;
+        let connection = Rc::new(connection);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let session_id = acp::SessionId::new("config-event-session");
+        let thread = cx
+            .update(|cx| {
+                connection.clone().open_or_create_session(
+                    session_id.clone(),
+                    project,
+                    util::path_list::PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    |_connection, _session_id, _directories| {
+                        Box::pin(async move {
+                            Ok(SessionConfigResponse {
+                                modes: None,
+                                config_options: Some(vec![acp::SessionConfigOption::boolean(
+                                    "web_search",
+                                    "Web Search",
+                                    false,
+                                )]),
+                            })
+                        })
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("loading the session should succeed");
+
+        let event_received = Rc::new(RefCell::new(false));
+        let _subscription = cx.update(|cx| {
+            let event_received = event_received.clone();
+            cx.subscribe(&thread, move |_thread, event, _cx| {
+                if matches!(event, acp_thread::AcpThreadEvent::ConfigOptionsUpdated(_)) {
+                    *event_received.borrow_mut() = true;
+                }
+            })
+        });
+
+        let config_options = cx
+            .update(|cx| connection.session_config_options(&session_id, cx))
+            .expect("loaded session should expose config options");
+        cx.update(|cx| {
+            config_options.set_config_option(
+                acp::SessionConfigId::new("web_search"),
+                acp::SessionConfigOptionValue::boolean(true),
+                cx,
+            )
+        })
+        .await
+        .expect("setting the config option should succeed");
+        cx.run_until_parked();
+
+        assert!(
+            *event_received.borrow(),
+            "setting a config option should emit a thread event"
+        );
+    }
+
     async fn connect_config_defaults_test_agent(
         cx: &mut gpui::TestAppContext,
     ) -> (
@@ -4461,6 +4593,7 @@ struct AcpSessionModes {
     session_id: acp::SessionId,
     connection: ConnectionTo<Agent>,
     state: Rc<RefCell<acp::SessionModeState>>,
+    thread: WeakEntity<AcpThread>,
 }
 
 impl acp_thread::AgentSessionModes for AcpSessionModes {
@@ -4482,9 +4615,10 @@ impl acp_thread::AgentSessionModes for AcpSessionModes {
             state.current_mode_id = mode_id.clone();
         };
         let state = self.state.clone();
-        cx.foreground_executor().spawn(async move {
+        let thread = self.thread.clone();
+        cx.spawn(async move |cx| {
             let result = connection
-                .send_request(acp::SetSessionModeRequest::new(session_id, mode_id))
+                .send_request(acp::SetSessionModeRequest::new(session_id, mode_id.clone()))
                 .block_task()
                 .await;
 
@@ -4493,6 +4627,11 @@ impl acp_thread::AgentSessionModes for AcpSessionModes {
             }
 
             result?;
+            thread
+                .update(cx, |_thread, cx| {
+                    cx.emit(AcpThreadEvent::ModeUpdated(mode_id));
+                })
+                .log_err();
 
             Ok(())
         })
@@ -4505,6 +4644,7 @@ struct AcpSessionConfigOptions {
     state: Rc<RefCell<Vec<acp::SessionConfigOption>>>,
     watch_tx: Rc<RefCell<watch::Sender<()>>>,
     watch_rx: watch::Receiver<()>,
+    thread: WeakEntity<AcpThread>,
 }
 
 impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
@@ -4523,8 +4663,9 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
         let state = self.state.clone();
 
         let watch_tx = self.watch_tx.clone();
+        let thread = self.thread.clone();
 
-        cx.foreground_executor().spawn(async move {
+        cx.spawn(async move |cx| {
             let response = connection
                 .send_request(acp::SetSessionConfigOptionRequest::new(
                     session_id, config_id, value,
@@ -4534,6 +4675,13 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
 
             *state.borrow_mut() = response.config_options.clone();
             watch_tx.borrow_mut().send(()).ok();
+            thread
+                .update(cx, |_thread, cx| {
+                    cx.emit(AcpThreadEvent::ConfigOptionsUpdated(
+                        response.config_options.clone(),
+                    ));
+                })
+                .log_err();
             Ok(response.config_options)
         })
     }

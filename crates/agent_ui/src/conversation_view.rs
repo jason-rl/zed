@@ -579,6 +579,8 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::Error
         | AcpThreadEvent::LoadError(_)
         | AcpThreadEvent::Refusal
+        | AcpThreadEvent::ModeUpdated(_)
+        | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::WorkingDirectoriesUpdated => true,
         // --
         AcpThreadEvent::EntryUpdated(_)
@@ -588,8 +590,6 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::TokenUsageUpdated
         | AcpThreadEvent::PromptCapabilitiesUpdated
         | AcpThreadEvent::AvailableCommandsUpdated(_)
-        | AcpThreadEvent::ModeUpdated(_)
-        | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
         | AcpThreadEvent::PromptUpdated => false,
     }
@@ -885,6 +885,7 @@ impl ConversationView {
                 agent.clone(),
                 connection_store,
                 connection_key,
+                thread_id,
                 resume_session_id,
                 work_dirs,
                 title,
@@ -1021,6 +1022,7 @@ impl ConversationView {
             self.agent.clone(),
             self.connection_store.clone(),
             self.connection_key.clone(),
+            self.thread_id,
             resume_session_id,
             work_dirs,
             title,
@@ -1046,6 +1048,7 @@ impl ConversationView {
         agent: Rc<dyn AgentServer>,
         connection_store: Entity<AgentConnectionStore>,
         connection_key: Agent,
+        thread_id: ThreadId,
         resume_session_id: Option<acp::SessionId>,
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
@@ -1087,6 +1090,14 @@ impl ConversationView {
             });
 
         let connect_result = connection_entry.read(cx).wait_for_connection();
+        let persisted_session_options = resume_session_id.as_ref().and_then(|_| {
+            ThreadMetadataStore::try_global(cx).and_then(|store| {
+                store
+                    .read(cx)
+                    .entry(thread_id)
+                    .map(|metadata| metadata.session_options.clone())
+            })
+        });
 
         let side = crate::agent_sidebar_side(cx);
         let thread_location = "current_worktree";
@@ -1181,6 +1192,24 @@ impl ConversationView {
                 },
                 Ok(thread) => Ok(thread),
             };
+
+            let restore_task =
+                if let (Ok(thread), Some(session_options)) = (&result, persisted_session_options) {
+                    cx.update(|_, cx| {
+                        let session_id = thread.read(cx).session_id().clone();
+                        session_options.restore(
+                            connection.session_modes(&session_id, cx),
+                            connection.session_config_options(&session_id, cx),
+                            cx,
+                        )
+                    })
+                    .log_err()
+                } else {
+                    None
+                };
+            if let Some(restore_task) = restore_task {
+                restore_task.await;
+            }
 
             this.update_in(cx, |this, window, cx| {
                 match result {
@@ -3751,6 +3780,16 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn session_option_updates_affect_thread_metadata() {
+        assert!(affects_thread_metadata(&AcpThreadEvent::ModeUpdated(
+            acp::SessionModeId::new("plan")
+        )));
+        assert!(affects_thread_metadata(
+            &AcpThreadEvent::ConfigOptionsUpdated(Vec::new())
+        ));
+    }
+
     #[gpui::test]
     async fn test_drop(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4715,6 +4754,7 @@ pub(crate) mod tests {
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
                         archived: false,
+                        session_options: Default::default(),
                     },
                     cx,
                 );
