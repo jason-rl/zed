@@ -106,14 +106,21 @@ pub enum SkillSource {
         worktree_id: SkillScopeId,
         worktree_root_name: Arc<str>,
     },
+    /// From a `.agents/skills/` directory below a worktree root.
+    ProjectLocalNested {
+        worktree_id: SkillScopeId,
+        worktree_root_name: Arc<str>,
+        /// Absolute path to the directory that contains `.agents`.
+        scope_path: PathBuf,
+        /// Worktree name plus the relative scope path, for example `zed/crates/agent`.
+        scope_label: Arc<str>,
+    },
 }
 
 impl SkillSource {
-    /// Precedence for resolving same-named skills. Higher values shadow
-    /// lower ones: `ProjectLocal` > `Global` > `BuiltIn`. Two sources
-    /// returning equal precedence (e.g. two project-local skills from
-    /// different worktrees) leave the winner up to the caller, which by
-    /// convention keeps the first one in iteration order.
+    /// Source precedence for resolving same-named skills. Higher values
+    /// shadow lower ones: project-local > global > built-in. Active nested
+    /// scopes apply their thread-specific recency precedence separately.
     ///
     /// Adding a new `SkillSource` variant should be a one-line change
     /// here — every consumer routes through this method so the hierarchy
@@ -122,22 +129,10 @@ impl SkillSource {
         match self {
             Self::BuiltIn => 0,
             Self::Global => 1,
-            Self::ProjectLocal { .. } => 2,
+            Self::ProjectLocal { .. } | Self::ProjectLocalNested { .. } => 2,
         }
     }
 
-    /// Scope prefix used in the `/<prefix>:<name>` slash-command
-    /// syntax that the autocomplete popup inserts. Global skills use
-    /// an empty prefix (so the inserted text is `/:<name>`), and
-    /// project-local skills use their worktree root name (so the
-    /// inserted text is `/<worktree>:<name>`).
-    ///
-    /// Using an empty prefix for globals rather than a literal
-    /// `global` means a worktree literally named `global` is no
-    /// longer ambiguous with the global source: the global skill is
-    /// invoked as `/:<name>`, and the worktree's skill is invoked as
-    /// `/global:<name>`. The two grammars never collide on the
-    /// inserted text.
     /// Human-readable label for this source, used in the UI to
     /// distinguish skills from different origins.
     pub fn display_label(&self) -> &str {
@@ -147,34 +142,48 @@ impl SkillSource {
             Self::ProjectLocal {
                 worktree_root_name, ..
             } => worktree_root_name.as_ref(),
+            Self::ProjectLocalNested { scope_label, .. } => scope_label.as_ref(),
         }
     }
 
+    /// Scope prefix used in the `/<prefix>:<name>` slash-command syntax.
+    /// Global skills use an empty prefix (`/:<name>`), and project-local
+    /// skills use their worktree root name or nested scope label
+    /// (`/<scope>:<name>`).
+    ///
+    /// Using an empty prefix for globals rather than a literal
+    /// `global` means a worktree literally named `global` is no
+    /// longer ambiguous with the global source: the global skill is
+    /// invoked as `/:<name>`, and the worktree's skill is invoked as
+    /// `/global:<name>`. The two grammars never collide on the
+    /// qualified command.
     pub fn scope_prefix(&self) -> &str {
         match self {
             Self::BuiltIn | Self::Global => "",
             Self::ProjectLocal {
                 worktree_root_name, ..
             } => worktree_root_name.as_ref(),
+            Self::ProjectLocalNested { scope_label, .. } => scope_label.as_ref(),
         }
     }
 
     /// Whether this source matches the given scope qualifier from a
     /// `/<scope>:<name>` slash command. The empty scope is reserved
-    /// for global skills; non-empty scopes match a project-local
-    /// skill whose worktree root name equals the scope.
+    /// for global skills; non-empty scopes match the displayed scope
+    /// of a root or nested project-local skill.
     ///
     /// Hand-typed `/global:<name>` is NOT treated as an alias for
     /// `/:<name>`. It looks for a project-local skill from a worktree
-    /// named `global` and fails if none exists. The popup always
-    /// inserts the unambiguous form (`/:<name>` for globals), so this
-    /// strictness only affects users typing by memory.
+    /// named `global` and fails if none exists.
     pub fn matches_scope(&self, scope: &str) -> bool {
         match self {
             Self::BuiltIn | Self::Global => scope.is_empty(),
             Self::ProjectLocal {
                 worktree_root_name, ..
             } => !scope.is_empty() && worktree_root_name.as_ref() == scope,
+            Self::ProjectLocalNested { scope_label, .. } => {
+                !scope.is_empty() && scope_label.as_ref() == scope
+            }
         }
     }
 }
