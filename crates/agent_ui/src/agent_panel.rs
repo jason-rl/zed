@@ -7983,6 +7983,7 @@ mod tests {
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
+                        session_options: Default::default(),
                         archived: false,
                     },
                     cx,
