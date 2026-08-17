@@ -342,9 +342,10 @@ fn session_title(title: Option<SharedString>) -> SharedString {
 pub struct AvailableSkill {
     pub name: Arc<str>,
     pub description: Arc<str>,
-    /// Scope prefix for this skill: empty for global skills, or the
-    /// worktree root name for project-local skills.
+    /// Human-readable source label shown in completion and mentions.
     pub source: SharedString,
+    /// Qualifier used by typed `/<scope>:<name>` invocation.
+    pub scope: SharedString,
     pub skill_file_path: PathBuf,
     pub warning: Option<SharedString>,
 }

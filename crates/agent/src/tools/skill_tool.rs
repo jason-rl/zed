@@ -47,11 +47,15 @@ pub fn render_skill_envelope(skill: &Skill, body: &str) -> String {
     let source = match &skill.source {
         agent_skills::SkillSource::BuiltIn => "built-in",
         agent_skills::SkillSource::Global => "global",
-        agent_skills::SkillSource::ProjectLocal { .. } => "project-local",
+        agent_skills::SkillSource::ProjectLocal { .. }
+        | agent_skills::SkillSource::ProjectLocalNested { .. } => "project-local",
     };
     let worktree = match &skill.source {
         agent_skills::SkillSource::BuiltIn | agent_skills::SkillSource::Global => None,
         agent_skills::SkillSource::ProjectLocal {
+            worktree_root_name, ..
+        }
+        | agent_skills::SkillSource::ProjectLocalNested {
             worktree_root_name, ..
         } => Some(worktree_root_name.clone()),
     };
