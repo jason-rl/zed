@@ -3302,6 +3302,7 @@ fn native_available_skills(
             name: skill.name.into(),
             description: skill.description.into(),
             source: skill.source,
+            scope: skill.scope,
             skill_file_path: skill.skill_file_path,
             warning: skill.warning,
         })

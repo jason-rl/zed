@@ -6087,7 +6087,7 @@ pub mod test {
         };
         use project::Project;
         use serde_json::json;
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
 
         cx.update(|cx| {
             register_settings(cx);
@@ -6120,6 +6120,15 @@ pub mod test {
                         "skills": {
                             "project-skill": {
                                 "SKILL.md": "---\nname: project-skill\ndescription: A project level skill\n---\n\nProject instructions."
+                            }
+                        }
+                    },
+                    "a": {
+                        ".agents": {
+                            "skills": {
+                                "nested-skill": {
+                                    "SKILL.md": "---\nname: nested-skill\ndescription: A nested project skill\n---\n\nNested instructions."
+                                }
                             }
                         }
                     },
@@ -6158,7 +6167,7 @@ pub mod test {
                 .into_iter()
                 .map(|result| result.expect("global skill should load"))
                 .collect();
-        let project_skills: Vec<Skill> = load_skills_from_directory(
+        let mut project_skills: Vec<Skill> = load_skills_from_directory(
             &fs,
             Path::new("/project/.agents/skills"),
             SkillSource::ProjectLocal {
@@ -6170,8 +6179,23 @@ pub mod test {
         .into_iter()
         .map(|result| result.expect("project skill should load"))
         .collect();
+        project_skills.extend(
+            load_skills_from_directory(
+                &fs,
+                Path::new("/project/a/.agents/skills"),
+                SkillSource::ProjectLocalNested {
+                    worktree_id: SkillScopeId(worktree_id.to_usize()),
+                    worktree_root_name: "project".into(),
+                    scope_path: PathBuf::from("/project/a"),
+                    scope_label: "project/a".into(),
+                },
+            )
+            .await
+            .into_iter()
+            .map(|result| result.expect("nested skill should load")),
+        );
         assert_eq!(global_skills.len(), 1);
-        assert_eq!(project_skills.len(), 1);
+        assert_eq!(project_skills.len(), 2);
 
         cx.update(|cx| {
             cx.set_global(SkillIndex {
@@ -6239,7 +6263,7 @@ pub mod test {
             assert_eq!(settings_window.sub_page_stack[0].link.title, "Skills");
             assert_eq!(
                 displayed_skill_names(settings_window, cx),
-                ["project-skill"]
+                ["project-skill", "nested-skill"]
             );
 
             let user_file_index = settings_window
