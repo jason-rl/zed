@@ -1,5 +1,7 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -142,6 +144,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
                         remote_connection: None,
                         archived: true,
+                        session_options: PersistedAcpSessionOptions::default(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -303,6 +306,163 @@ fn migrate_thread_ids(cx: &mut App) {
 struct GlobalThreadMetadataStore(Entity<ThreadMetadataStore>);
 impl Global for GlobalThreadMetadataStore {}
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct PersistedAcpSessionOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    config_options: BTreeMap<String, settings::AgentConfigOptionValue>,
+}
+
+impl PersistedAcpSessionOptions {
+    fn is_fast_mode(config_id: &str) -> bool {
+        matches!(config_id, "fast-mode" | "fast_mode")
+    }
+
+    fn from_config_options(config_options: &[acp::SessionConfigOption]) -> Self {
+        let config_options = config_options
+            .iter()
+            .filter(|option| !Self::is_fast_mode(option.id.0.as_ref()))
+            .filter_map(|option| {
+                let value = match &option.kind {
+                    acp::SessionConfigKind::Select(select) => {
+                        settings::AgentConfigOptionValue::ValueId(
+                            select.current_value.0.to_string(),
+                        )
+                    }
+                    acp::SessionConfigKind::Boolean(boolean) => {
+                        settings::AgentConfigOptionValue::Boolean(boolean.current_value)
+                    }
+                    _ => return None,
+                };
+                Some((option.id.0.to_string(), value))
+            })
+            .collect();
+
+        Self {
+            mode_id: None,
+            config_options,
+        }
+    }
+
+    fn capture(
+        session_modes: Option<Rc<dyn acp_thread::AgentSessionModes>>,
+        config_options: Option<Rc<dyn acp_thread::AgentSessionConfigOptions>>,
+    ) -> Option<Self> {
+        if let Some(config_options) = config_options {
+            return Some(Self::from_config_options(&config_options.config_options()));
+        }
+
+        session_modes.map(|session_modes| Self {
+            mode_id: Some(session_modes.current_mode().0.to_string()),
+            config_options: BTreeMap::new(),
+        })
+    }
+
+    fn config_value_to_restore(
+        option: &acp::SessionConfigOption,
+        persisted_value: &settings::AgentConfigOptionValue,
+    ) -> Option<acp::SessionConfigOptionValue> {
+        match (&option.kind, persisted_value) {
+            (
+                acp::SessionConfigKind::Select(select),
+                settings::AgentConfigOptionValue::ValueId(value),
+            ) => {
+                if select.current_value.0.as_ref() == value {
+                    return None;
+                }
+
+                let is_available = match &select.options {
+                    acp::SessionConfigSelectOptions::Ungrouped(options) => options
+                        .iter()
+                        .any(|option| option.value.0.as_ref() == value),
+                    acp::SessionConfigSelectOptions::Grouped(groups) => {
+                        groups.iter().any(|group| {
+                            group
+                                .options
+                                .iter()
+                                .any(|option| option.value.0.as_ref() == value)
+                        })
+                    }
+                    _ => false,
+                };
+                is_available.then(|| acp::SessionConfigOptionValue::value_id(value.clone()))
+            }
+            (
+                acp::SessionConfigKind::Boolean(boolean),
+                settings::AgentConfigOptionValue::Boolean(value),
+            ) if boolean.current_value != *value => {
+                Some(acp::SessionConfigOptionValue::boolean(*value))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn restore(
+        &self,
+        session_modes: Option<Rc<dyn acp_thread::AgentSessionModes>>,
+        config_options: Option<Rc<dyn acp_thread::AgentSessionConfigOptions>>,
+        cx: &mut App,
+    ) -> Task<()> {
+        if let Some(config_options) = config_options {
+            let persisted_config_options = self.config_options.clone();
+            return cx.spawn(async move |cx| {
+                for (config_id, persisted_value) in persisted_config_options {
+                    if Self::is_fast_mode(&config_id) {
+                        continue;
+                    }
+
+                    let value = config_options
+                        .config_options()
+                        .iter()
+                        .find(|option| option.id.0.as_ref() == config_id)
+                        .and_then(|option| Self::config_value_to_restore(option, &persisted_value));
+                    let Some(value) = value else {
+                        continue;
+                    };
+
+                    let task = cx.update(|cx| {
+                        config_options.set_config_option(
+                            acp::SessionConfigId::new(config_id.clone()),
+                            value,
+                            cx,
+                        )
+                    });
+
+                    if let Err(error) = task.await {
+                        log::error!(
+                            "Failed to restore session config option {config_id}: {error:#}"
+                        );
+                    }
+                }
+            });
+        }
+
+        let Some(session_modes) = session_modes else {
+            return Task::ready(());
+        };
+        let Some(mode_id) = self.mode_id.as_deref() else {
+            return Task::ready(());
+        };
+        if session_modes.current_mode().0.as_ref() == mode_id
+            || !session_modes
+                .all_modes()
+                .iter()
+                .any(|mode| mode.id.0.as_ref() == mode_id)
+        {
+            return Task::ready(());
+        }
+
+        let mode_id = acp::SessionModeId::new(mode_id.to_string());
+        let task = session_modes.set_mode(mode_id.clone(), cx);
+        cx.spawn(async move |_cx| {
+            if let Err(error) = task.await {
+                log::error!("Failed to restore session mode {mode_id}: {error:#}");
+            }
+        })
+    }
+}
+
 /// Lightweight metadata for any thread (native or ACP), enough to populate
 /// the sidebar list and route to the correct load path when clicked.
 #[derive(Debug, Clone, PartialEq)]
@@ -323,6 +483,7 @@ pub struct ThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
+    pub(crate) session_options: PersistedAcpSessionOptions,
 }
 
 impl ThreadMetadata {
@@ -1301,7 +1462,14 @@ impl ThreadMetadataStore {
             .map(|t| t.interacted_at)
             .unwrap_or(Some(updated_at));
 
-        let agent_id = thread_ref.connection().agent_id();
+        let connection = thread_ref.connection();
+        let agent_id = connection.agent_id();
+        let session_options = PersistedAcpSessionOptions::capture(
+            connection.session_modes(thread_ref.session_id(), cx),
+            connection.session_config_options(thread_ref.session_id(), cx),
+        )
+        .or_else(|| existing_thread.map(|thread| thread.session_options.clone()))
+        .unwrap_or_default();
 
         // Preserve project-dependent fields for archived threads.
         // The worktree may already have been removed from the
@@ -1350,6 +1518,7 @@ impl ThreadMetadataStore {
             worktree_paths,
             remote_connection,
             archived,
+            session_options,
         };
 
         self.save(metadata, cx);
@@ -1462,6 +1631,9 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN session_options TEXT;
+        ),
     ];
 }
 
@@ -1478,7 +1650,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
+        main_worktree_paths_order, remote_connection, title_override, session_options \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1528,13 +1700,21 @@ impl ThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize thread metadata remote connection")?;
+        let session_options = if row.session_options == PersistedAcpSessionOptions::default() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&row.session_options)
+                    .context("serialize thread metadata session options")?,
+            )
+        };
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, session_options) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1548,7 +1728,8 @@ impl ThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
+                           title_override = excluded.title_override, \
+                           session_options = excluded.session_options";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1563,7 +1744,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
+            i = stmt.bind(&title_override, i)?;
+            stmt.bind(&session_options, i)?;
             stmt.exec()
         })
         .await
@@ -1721,6 +1903,7 @@ impl Column for ThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (session_options_json, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1762,6 +1945,12 @@ impl Column for ThreadMetadata {
             .map(serde_json::from_str::<RemoteConnectionOptions>)
             .transpose()
             .context("deserialize thread metadata remote connection")?;
+        let session_options = session_options_json
+            .as_deref()
+            .map(serde_json::from_str::<PersistedAcpSessionOptions>)
+            .transpose()
+            .context("deserialize thread metadata session options")?
+            .unwrap_or_default();
 
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
@@ -1787,6 +1976,7 @@ impl Column for ThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 archived,
+                session_options,
             },
             next,
         ))
@@ -1821,7 +2011,7 @@ impl Column for ArchivedGitWorktree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acp_thread::StubAgentConnection;
+    use acp_thread::{AgentSessionConfigOptions as _, AgentSessionModes as _, StubAgentConnection};
     use action_log::ActionLog;
     use agent::DbThread;
     use agent_client_protocol::schema::v1 as acp;
@@ -1829,8 +2019,7 @@ mod tests {
     use project::FakeFs;
     use project::Project;
     use remote::WslConnectionOptions;
-    use std::path::Path;
-    use std::rc::Rc;
+    use std::{cell::RefCell, path::Path, rc::Rc};
     use workspace::MultiWorkspace;
 
     fn make_db_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
@@ -1878,6 +2067,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
+            session_options: PersistedAcpSessionOptions::default(),
         }
     }
 
@@ -1929,6 +2119,88 @@ mod tests {
         cx.run_until_parked();
     }
 
+    struct TestSessionConfigOptions {
+        options: RefCell<Vec<acp::SessionConfigOption>>,
+        set_ids: RefCell<Vec<String>>,
+    }
+
+    impl TestSessionConfigOptions {
+        fn new(options: Vec<acp::SessionConfigOption>) -> Self {
+            Self {
+                options: RefCell::new(options),
+                set_ids: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl acp_thread::AgentSessionConfigOptions for TestSessionConfigOptions {
+        fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+            self.options.borrow().clone()
+        }
+
+        fn set_config_option(
+            &self,
+            config_id: acp::SessionConfigId,
+            value: acp::SessionConfigOptionValue,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Vec<acp::SessionConfigOption>>> {
+            self.set_ids.borrow_mut().push(config_id.0.to_string());
+
+            let options = {
+                let mut options = self.options.borrow_mut();
+                if let Some(option) = options.iter_mut().find(|option| option.id == config_id) {
+                    match (&mut option.kind, value) {
+                        (
+                            acp::SessionConfigKind::Select(select),
+                            acp::SessionConfigOptionValue::ValueId { value },
+                        ) => select.current_value = value,
+                        (
+                            acp::SessionConfigKind::Boolean(boolean),
+                            acp::SessionConfigOptionValue::Boolean { value },
+                        ) => boolean.current_value = value,
+                        _ => {}
+                    }
+                }
+                options.clone()
+            };
+
+            Task::ready(Ok(options))
+        }
+    }
+
+    struct TestSessionModes {
+        current_mode: RefCell<acp::SessionModeId>,
+        set_modes: RefCell<Vec<acp::SessionModeId>>,
+    }
+
+    impl TestSessionModes {
+        fn new(current_mode: &str) -> Self {
+            Self {
+                current_mode: RefCell::new(acp::SessionModeId::new(current_mode)),
+                set_modes: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl acp_thread::AgentSessionModes for TestSessionModes {
+        fn current_mode(&self) -> acp::SessionModeId {
+            self.current_mode.borrow().clone()
+        }
+
+        fn all_modes(&self) -> Vec<acp::SessionMode> {
+            vec![
+                acp::SessionMode::new("default", "Default"),
+                acp::SessionMode::new("plan", "Plan"),
+            ]
+        }
+
+        fn set_mode(&self, mode: acp::SessionModeId, _cx: &mut App) -> Task<anyhow::Result<()>> {
+            *self.current_mode.borrow_mut() = mode.clone();
+            self.set_modes.borrow_mut().push(mode);
+            Task::ready(Ok(()))
+        }
+    }
+
     #[test]
     fn test_thread_metadata_title_prefers_override() {
         let mut metadata = make_metadata(
@@ -1972,6 +2244,175 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[test]
+    fn persisted_session_options_exclude_fast_mode() {
+        let session_options = PersistedAcpSessionOptions::from_config_options(&[
+            acp::SessionConfigOption::select(
+                "collaboration_mode",
+                "Collaboration mode",
+                "plan",
+                vec![
+                    acp::SessionConfigSelectOption::new("default", "Default"),
+                    acp::SessionConfigSelectOption::new("plan", "Plan"),
+                ],
+            ),
+            acp::SessionConfigOption::boolean("fast-mode", "Fast mode", true),
+            acp::SessionConfigOption::select(
+                "fast_mode",
+                "Fast mode",
+                "enabled",
+                vec![
+                    acp::SessionConfigSelectOption::new("enabled", "Enabled"),
+                    acp::SessionConfigSelectOption::new("disabled", "Disabled"),
+                ],
+            ),
+        ]);
+
+        assert_eq!(
+            session_options.config_options,
+            std::collections::BTreeMap::from_iter([(
+                "collaboration_mode".to_string(),
+                settings::AgentConfigOptionValue::from("plan"),
+            )])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_session_options(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let mut metadata = make_metadata(
+            "session-1",
+            "Thread with options",
+            now,
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        metadata.session_options = PersistedAcpSessionOptions {
+            mode_id: Some("plan".to_string()),
+            config_options: std::collections::BTreeMap::from_iter([
+                (
+                    "model".to_string(),
+                    settings::AgentConfigOptionValue::from("gpt-5"),
+                ),
+                (
+                    "web_search".to_string(),
+                    settings::AgentConfigOptionValue::Boolean(true),
+                ),
+            ]),
+        };
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(metadata.clone()).await.unwrap();
+
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_options, metadata.session_options);
+    }
+
+    #[gpui::test]
+    async fn restored_config_options_replay_only_valid_mismatches(cx: &mut TestAppContext) {
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select(
+                "collaboration_mode",
+                "Collaboration mode",
+                "default",
+                vec![
+                    acp::SessionConfigSelectOption::new("default", "Default"),
+                    acp::SessionConfigSelectOption::new("plan", "Plan"),
+                ],
+            ),
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "gpt-5",
+                vec![
+                    acp::SessionConfigSelectOption::new("gpt-5", "GPT-5"),
+                    acp::SessionConfigSelectOption::new("gpt-6", "GPT-6"),
+                ],
+            ),
+            acp::SessionConfigOption::select(
+                "invalid",
+                "Invalid saved option",
+                "supported",
+                vec![acp::SessionConfigSelectOption::new(
+                    "supported",
+                    "Supported",
+                )],
+            ),
+            acp::SessionConfigOption::boolean("web_search", "Web search", false),
+            acp::SessionConfigOption::boolean("fast-mode", "Fast mode", false),
+        ]));
+        let session_options = PersistedAcpSessionOptions {
+            mode_id: None,
+            config_options: BTreeMap::from_iter([
+                (
+                    "collaboration_mode".to_string(),
+                    settings::AgentConfigOptionValue::from("plan"),
+                ),
+                (
+                    "model".to_string(),
+                    settings::AgentConfigOptionValue::from("gpt-5"),
+                ),
+                (
+                    "invalid".to_string(),
+                    settings::AgentConfigOptionValue::from("not-supported"),
+                ),
+                (
+                    "web_search".to_string(),
+                    settings::AgentConfigOptionValue::Boolean(true),
+                ),
+                (
+                    "fast-mode".to_string(),
+                    settings::AgentConfigOptionValue::Boolean(true),
+                ),
+            ]),
+        };
+
+        cx.update(|cx| session_options.restore(None, Some(config_options.clone()), cx))
+            .await;
+
+        assert_eq!(
+            config_options.set_ids.borrow().as_slice(),
+            &["collaboration_mode", "web_search"]
+        );
+        let restored_options = config_options.config_options();
+        assert!(matches!(
+            &restored_options[0].kind,
+            acp::SessionConfigKind::Select(select) if select.current_value.0.as_ref() == "plan"
+        ));
+        assert!(matches!(
+            &restored_options[3].kind,
+            acp::SessionConfigKind::Boolean(boolean) if boolean.current_value
+        ));
+        assert!(matches!(
+            &restored_options[4].kind,
+            acp::SessionConfigKind::Boolean(boolean) if !boolean.current_value
+        ));
+    }
+
+    #[gpui::test]
+    async fn restored_legacy_mode_replays_valid_mismatch(cx: &mut TestAppContext) {
+        let session_modes = Rc::new(TestSessionModes::new("default"));
+        let session_options = PersistedAcpSessionOptions {
+            mode_id: Some("plan".to_string()),
+            config_options: BTreeMap::new(),
+        };
+
+        cx.update(|cx| session_options.restore(Some(session_modes.clone()), None, cx))
+            .await;
+
+        assert_eq!(session_modes.current_mode().0.as_ref(), "plan");
+        assert_eq!(
+            session_modes.set_modes.borrow().as_slice(),
+            &[acp::SessionModeId::new("plan")]
+        );
     }
 
     #[gpui::test]
@@ -2172,6 +2613,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
             remote_connection: None,
             archived: false,
+            session_options: PersistedAcpSessionOptions::default(),
         };
 
         cx.update(|cx| {
@@ -2257,6 +2699,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
             remote_connection: None,
             archived: false,
+            session_options: PersistedAcpSessionOptions::default(),
         };
 
         cx.update(|cx| {
@@ -2383,6 +2826,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
             remote_connection: None,
             archived: false,
+            session_options: PersistedAcpSessionOptions::default(),
         };
 
         cx.update(|cx| {
@@ -3127,6 +3571,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths.clone(),
             remote_connection: None,
+            session_options: PersistedAcpSessionOptions::default(),
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -3141,6 +3586,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths,
             remote_connection: Some(remote_a.clone()),
+            session_options: PersistedAcpSessionOptions::default(),
         };
 
         cx.update(|cx| {
