@@ -505,6 +505,23 @@ impl MentionSet {
                 tracked_buffers: Vec::new(),
             }));
         }
+
+        if let Some(project) = self.project.upgrade()
+            && let Some(project_path) = project
+                .read(cx)
+                .project_path_for_absolute_path(&skill_file_path, cx)
+        {
+            let buffer = project.update(cx, |project, cx| project.open_buffer(project_path, cx));
+            return cx.spawn(async move |_, cx| {
+                let buffer = buffer.await?;
+                let content = buffer.read_with(cx, |buffer, _cx| buffer.text());
+                Ok(Mention::Text {
+                    content,
+                    tracked_buffers: vec![buffer],
+                })
+            });
+        }
+
         cx.background_spawn(async move {
             let content = std::fs::read_to_string(&skill_file_path).map_err(|e| {
                 anyhow!(
@@ -833,6 +850,59 @@ mod tests {
                 assert_eq!(tracked_buffers.len(), 1);
             }
             other => panic!("Expected selection mention to resolve as text, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_nested_project_skill_mentions_use_project_buffers(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let skill_file_path = PathBuf::from("/project/a/.agents/skills/review/SKILL.md");
+        let skill_content =
+            "---\nname: review\ndescription: Review this package\n---\n\nNested instructions";
+        fs.insert_tree(
+            "/project",
+            json!({
+                "a": {
+                    ".agents": {
+                        "skills": {
+                            "review": {
+                                "SKILL.md": skill_content
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let mention_set = cx.new(|_cx| MentionSet::new(project.downgrade(), None));
+
+        let mention_task = mention_set.update(cx, |mention_set, cx| {
+            let http_client = project.read(cx).client().http_client();
+            mention_set.confirm_mention_for_uri(
+                MentionUri::Skill {
+                    name: "review".to_string(),
+                    source: "project/a".to_string(),
+                    skill_file_path: skill_file_path.clone(),
+                },
+                false,
+                http_client,
+                cx,
+            )
+        });
+
+        let mention = mention_task.await.unwrap();
+        match mention {
+            Mention::Text {
+                content,
+                tracked_buffers,
+            } => {
+                assert_eq!(content, skill_content);
+                assert_eq!(tracked_buffers.len(), 1);
+            }
+            other => panic!("Expected nested skill mention to resolve as text, got {other:?}"),
         }
     }
 

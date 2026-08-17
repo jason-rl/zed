@@ -1294,6 +1294,7 @@ pub struct Thread {
     /// the workspace is restricted. Used purely to surface a warning in the UI.
     profile_downgraded_for_restricted_workspace: bool,
     project_context: Entity<ProjectContext>,
+    active_skill_scopes: Vec<PathBuf>,
     pub(crate) templates: Arc<Templates>,
     model: ThreadModel,
     summarization_model: Option<Arc<dyn LanguageModel>>,
@@ -1330,7 +1331,9 @@ impl Thread {
 
     pub fn new_subagent(parent_thread: &Entity<Thread>, cx: &mut Context<Self>) -> Self {
         let project = parent_thread.read(cx).project.clone();
-        let project_context = parent_thread.read(cx).project_context.clone();
+        let parent_project_context = parent_thread.read(cx).project_context.read(cx).clone();
+        let project_context = cx.new(|_| parent_project_context);
+        let active_skill_scopes = parent_thread.read(cx).active_skill_scopes.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
         let templates = parent_thread.read(cx).templates.clone();
         let model = parent_thread.read(cx).model().cloned();
@@ -1350,6 +1353,7 @@ impl Thread {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
         });
+        thread.active_skill_scopes = active_skill_scopes;
         thread.inherit_parent_settings(parent_thread, cx);
         if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
             thread.inherits_parent_model_settings = false;
@@ -1437,6 +1441,7 @@ impl Thread {
             profile_id,
             profile_downgraded_for_restricted_workspace,
             project_context,
+            active_skill_scopes: Vec::new(),
             templates,
             model,
             summarization_model: None,
@@ -1815,6 +1820,7 @@ impl Thread {
             profile_id,
             profile_downgraded_for_restricted_workspace: false,
             project_context,
+            active_skill_scopes: db_thread.active_skill_scopes,
             templates,
             model,
             summarization_model: None,
@@ -1934,6 +1940,7 @@ impl Thread {
                 }
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
+            active_skill_scopes: self.active_skill_scopes.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
         };
 
@@ -1962,6 +1969,60 @@ impl Thread {
 
     pub fn project_context(&self) -> &Entity<ProjectContext> {
         &self.project_context
+    }
+
+    pub fn active_skill_scopes(&self) -> &[PathBuf] {
+        &self.active_skill_scopes
+    }
+
+    pub(crate) fn activate_skill_scopes_for_path(
+        &mut self,
+        path: &Path,
+        path_is_directory: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let directory_input_path = if path_is_directory {
+            path
+        } else {
+            path.parent().unwrap_or_else(|| Path::new(""))
+        };
+        let Some(project_path) = self
+            .project
+            .read(cx)
+            .find_project_path(directory_input_path, cx)
+        else {
+            return;
+        };
+        let Some(worktree) = self
+            .project
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)
+        else {
+            return;
+        };
+        let directory_path = project_path.path;
+        let scopes = worktree.read_with(cx, |worktree, _cx| {
+            directory_path
+                .ancestors()
+                .rev()
+                .filter(|ancestor| !ancestor.is_empty())
+                .map(|ancestor| worktree.absolutize(ancestor))
+                .collect::<Vec<_>>()
+        });
+        if scopes.is_empty() {
+            return;
+        }
+
+        let previous_scopes = self.active_skill_scopes.clone();
+        for scope in scopes {
+            self.active_skill_scopes
+                .retain(|active_scope| active_scope != &scope);
+            self.active_skill_scopes.push(scope);
+        }
+        if self.active_skill_scopes != previous_scopes {
+            cx.emit(ActiveSkillScopesUpdated);
+            cx.notify();
+        }
     }
 
     pub fn project(&self) -> &Entity<Project> {
@@ -4907,6 +4968,10 @@ pub struct ModelChanged;
 
 impl EventEmitter<ModelChanged> for Thread {}
 
+pub struct ActiveSkillScopesUpdated;
+
+impl EventEmitter<ActiveSkillScopesUpdated> for Thread {}
+
 /// A channel-based wrapper that delivers tool input to a running tool.
 ///
 /// For non-streaming tools, created via `ToolInput::ready()` so `.recv()` resolves immediately.
@@ -4914,6 +4979,7 @@ impl EventEmitter<ModelChanged> for Thread {}
 /// them, followed by the final complete input available through `.recv()`.
 pub struct ToolInput<T> {
     rx: mpsc::UnboundedReceiver<ToolInputPayload<serde_json::Value>>,
+    final_input: Rc<RefCell<Option<serde_json::Value>>>,
     _phantom: PhantomData<T>,
 }
 
@@ -4929,6 +4995,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
         tx.unbounded_send(ToolInputPayload::Full(value)).ok();
         Self {
             rx,
+            final_input: Rc::new(RefCell::new(None)),
             _phantom: PhantomData,
         }
     }
@@ -4939,6 +5006,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
             .ok();
         Self {
             rx,
+            final_input: Rc::new(RefCell::new(None)),
             _phantom: PhantomData,
         }
     }
@@ -4974,6 +5042,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
         Ok(match value {
             ToolInputPayload::Partial(payload) => ToolInputPayload::Partial(payload),
             ToolInputPayload::Full(payload) => {
+                *self.final_input.borrow_mut() = Some(payload.clone());
                 ToolInputPayload::Full(serde_json::from_value(payload)?)
             }
             ToolInputPayload::InvalidJson { error_message } => {
@@ -4985,6 +5054,7 @@ impl<T: DeserializeOwned> ToolInput<T> {
     fn cast<U: DeserializeOwned>(self) -> ToolInput<U> {
         ToolInput {
             rx: self.rx,
+            final_input: self.final_input,
             _phantom: PhantomData,
         }
     }
@@ -5010,6 +5080,7 @@ impl ToolInputSender {
         };
         let input = ToolInput {
             rx,
+            final_input: Rc::new(RefCell::new(None)),
             _phantom: PhantomData,
         };
         (sender, input)
@@ -5217,10 +5288,15 @@ where
         event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<AgentToolOutput, AgentToolOutput>> {
+        let final_input = input.final_input.clone();
         let tool_input: ToolInput<T::Input> = input.cast();
+        let activation_event_stream = event_stream.clone();
         let task = self.0.clone().run(tool_input, event_stream, cx);
-        cx.spawn(async move |_cx| match task.await {
+        cx.spawn(async move |cx| match task.await {
             Ok(output) => {
+                if let Some(input) = final_input.borrow().as_ref() {
+                    activation_event_stream.activate_nested_skill_scopes(T::NAME, input, cx);
+                }
                 let raw_output = serde_json::to_value(&output).unwrap_or_else(|e| {
                     log::error!("Failed to serialize tool output: {e}");
                     serde_json::Value::Null
@@ -5461,6 +5537,22 @@ impl ToolCallEventStream {
         (stream, receiver)
     }
 
+    #[cfg(test)]
+    fn test_for_thread(thread: WeakEntity<Thread>) -> (Self, ToolCallEventStreamReceiver) {
+        let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        let stream = ToolCallEventStream::new(
+            "test_id".into(),
+            acp::ToolCallId::new("0:test_id"),
+            ThreadEventStream(events_tx),
+            None,
+            cancellation_rx,
+            Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            Some(thread),
+        );
+        (stream, ToolCallEventStreamReceiver(events_rx))
+    }
+
     /// Like [`Self::test`], but the returned stream shares the provided
     /// thread-scoped sandbox grants. This mirrors how a real [`Thread`] builds a
     /// distinct event stream per tool call while sharing one set of grants, so
@@ -5555,6 +5647,33 @@ impl ToolCallEventStream {
         let Some(thread) = thread else { return };
         cx.update(|cx| {
             thread.update(cx, |_thread, cx| cx.notify()).ok();
+        });
+    }
+
+    fn activate_nested_skill_scopes(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        cx: &mut AsyncApp,
+    ) {
+        let path_is_directory = match tool_name {
+            "list_directory" => true,
+            "read_file" | "edit_file" | "write_file" => false,
+            _ => return,
+        };
+        let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(thread) = self.thread.clone() else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        cx.update(|cx| {
+            thread
+                .update(cx, |thread, cx| {
+                    thread.activate_skill_scopes_for_path(&path, path_is_directory, cx)
+                })
+                .log_err();
         });
     }
 
@@ -6856,6 +6975,111 @@ mod tests {
 
             (thread, event_stream)
         })
+    }
+
+    #[gpui::test]
+    async fn test_nested_skill_scope_activation_is_ordered_persisted_and_inherited(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            LanguageModelRegistry::test(cx);
+        });
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/project",
+            json!({
+                "a": {
+                    "file.txt": "a",
+                    "b": { "file.txt": "b" }
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let templates = Templates::new();
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_| ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    None,
+                    cx,
+                )
+            })
+        });
+
+        let read_tool = thread.read_with(cx, |thread, _cx| {
+            ReadFileTool::new(project, thread.action_log.clone(), false).erase()
+        });
+        let (event_stream, _receiver) = ToolCallEventStream::test_for_thread(thread.downgrade());
+        let failed_read = cx
+            .update(|cx| {
+                read_tool.clone().run(
+                    ToolInput::ready(json!({ "path": "project/a/b/missing.txt" })),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+        assert!(failed_read.is_err());
+        assert!(thread.read_with(cx, |thread, _cx| thread.active_skill_scopes.is_empty()));
+
+        let (event_stream, _receiver) = ToolCallEventStream::test_for_thread(thread.downgrade());
+        let successful_read = cx
+            .update(|cx| {
+                read_tool.run(
+                    ToolInput::ready(json!({ "path": "project/a/b/file.txt" })),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+        assert!(successful_read.is_ok());
+        let expected = vec![PathBuf::from("/project/a"), PathBuf::from("/project/a/b")];
+        assert_eq!(
+            thread.read_with(cx, |thread, _cx| thread.active_skill_scopes.clone()),
+            expected
+        );
+
+        let persisted = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        assert_eq!(persisted.active_skill_scopes, expected);
+
+        let subagent = cx.new(|cx| Thread::new_subagent(&thread, cx));
+        assert_eq!(
+            subagent.read_with(cx, |thread, _cx| thread.active_skill_scopes.clone()),
+            expected
+        );
+        subagent.update(cx, |thread, cx| {
+            thread.activate_skill_scopes_for_path(Path::new("project/a/file.txt"), false, cx);
+        });
+        assert_eq!(
+            subagent.read_with(cx, |thread, _cx| thread.active_skill_scopes.clone()),
+            vec![PathBuf::from("/project/a/b"), PathBuf::from("/project/a")]
+        );
+        assert_eq!(
+            thread.read_with(cx, |thread, _cx| thread.active_skill_scopes.clone()),
+            expected
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread.activate_skill_scopes_for_path(Path::new("a/new.txt"), false, cx);
+        });
+        let reordered = vec![PathBuf::from("/project/a/b"), PathBuf::from("/project/a")];
+        assert_eq!(
+            thread.read_with(cx, |thread, _cx| thread.active_skill_scopes.clone()),
+            reordered,
+            "a newly written file should activate its existing parent directory"
+        );
+        let persisted = thread.read_with(cx, |thread, cx| thread.to_db(cx)).await;
+        assert_eq!(persisted.active_skill_scopes, reordered);
     }
 
     fn set_auto_compact_settings(cx: &mut App, auto_compact: agent_settings::AutoCompactSettings) {

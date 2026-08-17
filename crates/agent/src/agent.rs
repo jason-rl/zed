@@ -164,6 +164,7 @@ pub struct NativeAvailableSkill {
     pub name: String,
     pub description: String,
     pub source: SharedString,
+    pub scope: SharedString,
     pub skill_file_path: PathBuf,
     pub warning: Option<SharedString>,
 }
@@ -174,6 +175,7 @@ impl From<&Skill> for NativeAvailableSkill {
             name: skill.name.clone(),
             description: skill.description.clone(),
             source: skill.source.display_label().to_string().into(),
+            scope: skill.source.scope_prefix().to_string().into(),
             skill_file_path: skill.skill_file_path.clone(),
             warning: skill
                 .load_warnings
@@ -482,22 +484,17 @@ static RULES_FILE_REL_PATHS: LazyLock<Vec<Arc<RelPath>>> = LazyLock::new(|| {
         .collect()
 });
 
-static AGENTS_PREFIX: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
-    RelPath::from_unix_str(AGENTS_DIR_NAME)
-        .ok()
-        .map(|path| path.into_arc())
-});
-
-static SKILLS_PREFIX: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
-    RelPath::from_unix_str(project_skills_relative_path())
-        .ok()
-        .map(|path| path.into_arc())
-});
-
 struct ProjectSkillFile {
     relative_path: Arc<RelPath>,
+    scope_relative_path: Arc<RelPath>,
     display_path: PathBuf,
     size: u64,
+}
+
+fn is_agents_path(path: &RelPath) -> bool {
+    path.as_std_path()
+        .components()
+        .any(|component| component.as_os_str() == AGENTS_DIR_NAME)
 }
 
 async fn expand_worktree_directory(
@@ -524,53 +521,72 @@ async fn expand_project_skills_directories(
     worktree: &Entity<Worktree>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    let agents_dir = RelPath::from_unix_str(AGENTS_DIR_NAME)?;
-    let Some(skills_prefix) = SKILLS_PREFIX.as_ref() else {
-        return Ok(());
-    };
+    let mut expanded_agents_directories = HashSet::default();
+    loop {
+        let agents_directories = worktree.update(cx, |worktree, _cx| {
+            worktree
+                .directories(true, 0)
+                .filter(|entry| entry.path.file_name() == Some(AGENTS_DIR_NAME))
+                .map(|entry| entry.path.clone())
+                .filter(|path| expanded_agents_directories.insert(path.clone()))
+                .collect::<Vec<_>>()
+        });
+        if agents_directories.is_empty() {
+            break;
+        }
 
-    expand_worktree_directory(worktree, agents_dir, cx).await?;
-    expand_worktree_directory(worktree, skills_prefix, cx).await?;
+        for agents_directory in agents_directories {
+            expand_worktree_directory(worktree, &agents_directory, cx).await?;
+            let skills_directory = agents_directory.join(RelPath::from_unix_str("skills")?);
+            expand_worktree_directory(worktree, &skills_directory, cx).await?;
 
-    let skill_dirs = worktree.update(cx, |worktree, _cx| {
-        worktree
-            .child_entries(skills_prefix)
-            .filter(|entry| entry.is_dir())
-            .map(|entry| entry.path.clone())
-            .collect::<Vec<_>>()
-    });
-    for skill_dir in skill_dirs {
-        expand_worktree_directory(worktree, &skill_dir, cx).await?;
+            let skill_directories = worktree.update(cx, |worktree, _cx| {
+                worktree
+                    .child_entries(&skills_directory)
+                    .filter(|entry| entry.is_dir())
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>()
+            });
+            for skill_directory in skill_directories {
+                expand_worktree_directory(worktree, &skill_directory, cx).await?;
+            }
+        }
     }
 
     Ok(())
 }
 
 fn project_skill_files_from_worktree(worktree: &Worktree) -> Vec<ProjectSkillFile> {
-    let Some(skills_prefix) = SKILLS_PREFIX.as_ref() else {
-        return Vec::new();
-    };
-    let Ok(skill_file_name) = RelPath::from_unix_str(SKILL_FILE_NAME) else {
-        return Vec::new();
-    };
-
     let mut skill_files = Vec::new();
-    for skill_dir in worktree.child_entries(skills_prefix) {
-        if !skill_dir.is_dir() {
+    for skill_file in worktree.files(true, 0) {
+        let relative_path = skill_file.path.as_ref();
+        if relative_path.file_name() != Some(SKILL_FILE_NAME) {
             continue;
         }
-
-        let relative_path = skill_dir.path.join(skill_file_name);
-        let Some(skill_file) = worktree.entry_for_path(&relative_path) else {
+        let Some(skill_directory) = relative_path.parent() else {
             continue;
         };
-        if !skill_file.is_file() {
+        let Some(skills_directory) = skill_directory.parent() else {
+            continue;
+        };
+        if skills_directory.file_name() != Some("skills") {
             continue;
         }
+        let Some(agents_directory) = skills_directory.parent() else {
+            continue;
+        };
+        if agents_directory.file_name() != Some(AGENTS_DIR_NAME) {
+            continue;
+        }
+        let scope_relative_path = agents_directory
+            .parent()
+            .map(RelPath::into_arc)
+            .unwrap_or_else(RelPath::empty_arc);
 
         skill_files.push(ProjectSkillFile {
             display_path: worktree.absolutize(&relative_path),
-            relative_path: relative_path.into(),
+            relative_path: relative_path.into_arc(),
+            scope_relative_path,
             size: skill_file.size,
         });
     }
@@ -765,10 +781,12 @@ impl NativeAgent {
             self.models
                 .model_from_id(&LanguageModels::model_id(&default_model.model))
         });
+        let thread_project_context = project_state.project_context.read(cx).clone();
+        let thread_project_context = cx.new(|_| thread_project_context);
         let thread = cx.new(|cx| {
             Thread::new(
                 project,
-                project_state.project_context.clone(),
+                thread_project_context,
                 project_state.context_server_registry.clone(),
                 self.templates.clone(),
                 default_model,
@@ -837,7 +855,7 @@ impl NativeAgent {
             // model — without this, the catalog and tool would drift out
             // of sync until the session was reopened.
             thread.add_tool(SkillTool::with_body_resolver(
-                skills_resolver_for_project(weak.clone(), project_id),
+                skills_resolver_for_session(weak.clone(), session_id.clone()),
                 skill_body_resolver_for_project(project.clone(), self.fs.clone()),
             ));
         });
@@ -845,6 +863,7 @@ impl NativeAgent {
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
+            cx.subscribe(&thread_handle, Self::handle_active_skill_scopes_updated),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
             }),
@@ -873,7 +892,7 @@ impl NativeAgent {
         self.sessions.insert(
             session_id,
             Session {
-                thread: thread_handle,
+                thread: thread_handle.clone(),
                 acp_thread: acp_thread.clone(),
                 project_id,
                 pending_save,
@@ -883,6 +902,17 @@ impl NativeAgent {
                 ref_count,
             },
         );
+
+        if let Some(state) = self.projects.get(&project_id) {
+            let base_project_context = state.project_context.read(cx).clone();
+            let skills = state.skills.clone();
+            Self::refresh_thread_project_context(
+                &thread_handle,
+                &base_project_context,
+                &skills,
+                cx,
+            );
+        }
 
         self.update_available_commands_for_project(project_id, cx);
 
@@ -1027,7 +1057,7 @@ impl NativeAgent {
                     .unwrap_or(true);
 
                 if let Some(state) = this.projects.get_mut(&project_id) {
-                    state.skills = skills;
+                    state.skills = skills.clone();
                     state.skill_loading_issues = skill_loading_issues.clone();
                     // Only push the new `ProjectContext` through if it
                     // differs from the current one. The system prompt is
@@ -1042,10 +1072,19 @@ impl NativeAgent {
                         .project_context
                         .update(cx, |current_project_context, cx| {
                             if *current_project_context != project_context {
-                                *current_project_context = project_context;
+                                *current_project_context = project_context.clone();
                                 cx.notify();
                             }
                         });
+                }
+                let session_threads = this
+                    .sessions
+                    .values()
+                    .filter(|session| session.project_id == project_id)
+                    .map(|session| session.thread.clone())
+                    .collect::<Vec<_>>();
+                for thread in session_threads {
+                    Self::refresh_thread_project_context(&thread, &project_context, &skills, cx);
                 }
                 if issues_changed {
                     cx.emit(SkillLoadingIssuesUpdated {
@@ -1150,11 +1189,6 @@ impl NativeAgent {
                     let skill_files = worktree.update(cx, |worktree, _cx| {
                         project_skill_files_from_worktree(worktree)
                     });
-                    let source = SkillSource::ProjectLocal {
-                        worktree_id: SkillScopeId(worktree_id.to_usize()),
-                        worktree_root_name,
-                    };
-
                     let mut worktree_results = Vec::new();
                     for skill_file in skill_files {
                         if skill_file.size > MAX_SKILL_FILE_SIZE as u64 {
@@ -1189,6 +1223,29 @@ impl NativeAgent {
 
                         let content = cx
                             .update(|cx| buffer.read(cx).as_text_snapshot().as_rope().to_string());
+
+                        let source = if skill_file.scope_relative_path.is_empty() {
+                            SkillSource::ProjectLocal {
+                                worktree_id: SkillScopeId(worktree_id.to_usize()),
+                                worktree_root_name: worktree_root_name.clone(),
+                            }
+                        } else {
+                            let scope_path = worktree.update(cx, |worktree, _cx| {
+                                worktree.absolutize(&skill_file.scope_relative_path)
+                            });
+                            let scope_label: Arc<str> = format!(
+                                "{}/{}",
+                                worktree_root_name,
+                                skill_file.scope_relative_path.as_unix_str()
+                            )
+                            .into();
+                            SkillSource::ProjectLocalNested {
+                                worktree_id: SkillScopeId(worktree_id.to_usize()),
+                                worktree_root_name: worktree_root_name.clone(),
+                                scope_path,
+                                scope_label,
+                            }
+                        };
 
                         worktree_results.push(
                             parse_skill_frontmatter(
@@ -1386,6 +1443,41 @@ impl NativeAgent {
         });
     }
 
+    fn handle_active_skill_scopes_updated(
+        &mut self,
+        thread: Entity<Thread>,
+        _event: &ActiveSkillScopesUpdated,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(thread.read(cx).id()) else {
+            return;
+        };
+        let Some(state) = self.projects.get(&session.project_id) else {
+            return;
+        };
+        let base_project_context = state.project_context.read(cx).clone();
+        let skills = state.skills.clone();
+        Self::refresh_thread_project_context(&thread, &base_project_context, &skills, cx);
+    }
+
+    fn refresh_thread_project_context(
+        thread: &Entity<Thread>,
+        base_project_context: &ProjectContext,
+        skills: &[Skill],
+        cx: &mut App,
+    ) {
+        let active_nested_scopes = thread.read(cx).active_skill_scopes().to_vec();
+        let project_context =
+            project_context_for_thread(base_project_context, skills, &active_nested_scopes);
+        let thread_project_context = thread.read(cx).project_context().clone();
+        thread_project_context.update(cx, |current_project_context, cx| {
+            if *current_project_context != project_context {
+                *current_project_context = project_context;
+                cx.notify();
+            }
+        });
+    }
+
     fn handle_project_event(
         &mut self,
         project: Entity<Project>,
@@ -1406,9 +1498,7 @@ impl NativeAgent {
                     RULES_FILE_REL_PATHS
                         .iter()
                         .any(|rules_path| path_ref == rules_path.as_ref())
-                        || AGENTS_PREFIX
-                            .as_ref()
-                            .is_some_and(|prefix| path_ref.starts_with(prefix))
+                        || is_agents_path(path_ref)
                 }) {
                     state.project_context_needs_refresh.send(()).ok();
                 }
@@ -1502,6 +1592,11 @@ impl NativeAgent {
                     SkillSource::ProjectLocal {
                         worktree_id,
                         worktree_root_name,
+                    }
+                    | SkillSource::ProjectLocalNested {
+                        worktree_id,
+                        worktree_root_name,
+                        ..
                     } => {
                         if let Some(group) = project_groups
                             .iter_mut()
@@ -1637,13 +1732,15 @@ impl NativeAgent {
                 let summarization_model = LanguageModelRegistry::read_global(cx)
                     .thread_summary_model(cx)
                     .map(|c| c.model);
+                let thread_project_context = project_state.project_context.read(cx).clone();
+                let thread_project_context = cx.new(|_| thread_project_context);
 
                 Ok(cx.new(|cx| {
                     let mut thread = Thread::from_db(
                         id.clone(),
                         db_thread,
                         project_state.project.clone(),
-                        project_state.project_context.clone(),
+                        thread_project_context,
                         project_state.context_server_registry.clone(),
                         this.templates.clone(),
                         cx,
@@ -2422,11 +2519,10 @@ struct Command<'a> {
     /// delimiters (`.` for MCP, `:` for skill scopes) so they can't
     /// collide.
     explicit_server_id: Option<&'a str>,
-    /// Skill scope qualifier from `/<scope>:<name>` syntax, where
-    /// `<scope>` is either the literal `global` or a worktree root
-    /// name. The `:` separator namespaces these against MCP server
-    /// prefixes (which use `.`) so an MCP server literally named
-    /// `global` or named after a worktree still parses unambiguously.
+    /// Skill scope qualifier from `/<scope>:<name>` syntax, where an
+    /// empty scope identifies a global skill and a non-empty scope is
+    /// a worktree label with an optional nested directory. The `:`
+    /// separator namespaces these against MCP server prefixes.
     skill_scope: Option<&'a str>,
 }
 
@@ -2863,6 +2959,13 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
             }
             return Task::ready(Err(anyhow::anyhow!("Session not found")));
         };
+        let active_nested_scopes = self
+            .0
+            .read(cx)
+            .sessions
+            .get(&session_id)
+            .map(|session| session.thread.read(cx).active_skill_scopes().to_vec())
+            .unwrap_or_default();
 
         if let Some(parsed_command) = Command::parse(&params.prompt) {
             if parsed_command.is_unqualified(COMPACT_COMMAND_NAME) {
@@ -2872,15 +2975,14 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
             }
 
             // Skill scope qualifiers (`/:<name>` and
-            // `/<worktree>:<name>`) use a colon separator that can't
-            // collide with MCP's `/<server>.<name>` grammar. The popup
-            // inserts a qualified form for every skill so picking the
-            // global row unambiguously runs the global skill even when
-            // a same-named project-local one exists.
+            // `/<project-scope>:<name>`) use a colon separator that can't
+            // collide with MCP's `/<server>.<name>` grammar.
             if let Some(scope) = parsed_command.skill_scope
-                && let Some(skill) = project_state.skills.iter().find(|skill| {
-                    skill.name == parsed_command.prompt_name && skill.source.matches_scope(scope)
-                })
+                && let Some(skill) = resolve_qualified_skill(
+                    &project_state.skills,
+                    parsed_command.prompt_name,
+                    scope,
+                )
             {
                 let skill = skill.clone();
                 return self.0.update(cx, |agent, cx| {
@@ -2943,34 +3045,19 @@ impl acp_thread::AgentSessionClientUserMessageIds for NativeAgentConnection {
             // The user explicitly typed the name, so they get to invoke
             // it.
             //
-            // Inlined rather than calling `apply_skill_overrides` so
-            // we don't clone the entire skill list on every prompt
-            // (including prompts like `/help` that aren't skills at
-            // all). The resolution rule matches the override-applied
-            // view: among skills with the matching name, pick the one
-            // with the highest source precedence, so the slash command
-            // picks the same entry the model sees in its catalog.
-            // Ties (e.g. two project-local skills from different
-            // worktrees) resolve to the first in iteration order to
-            // match `apply_skill_overrides`.
+            // Unqualified invocation uses the thread's effective
+            // precedence, including the recency order of active nested
+            // scopes. Manual invocation does not activate a scope.
             if parsed_command.explicit_server_id.is_none()
                 && parsed_command.skill_scope.is_none()
                 && !project_state.skills.is_empty()
             {
                 let prompt_name = parsed_command.prompt_name;
-                let resolved = project_state
-                    .skills
-                    .iter()
-                    .filter(|skill| skill.name == prompt_name)
-                    .reduce(|best, candidate| {
-                        if candidate.source.precedence() > best.source.precedence() {
-                            candidate
-                        } else {
-                            best
-                        }
-                    });
+                let resolved =
+                    effective_skills_for_thread(&project_state.skills, &active_nested_scopes)
+                        .into_iter()
+                        .find(|skill| skill.name == prompt_name);
                 if let Some(skill) = resolved {
-                    let skill = skill.clone();
                     return self.0.update(cx, |agent, cx| {
                         agent.send_skill_invocation(
                             client_user_message_id,
@@ -3667,12 +3754,9 @@ fn select_catalog_skills(skills: &[Skill]) -> (Vec<SkillSummary>, Vec<SkillLoadi
     (kept, issues)
 }
 
-/// Build a closure that, when called, reads the latest `state.skills`
-/// for the given project from the `NativeAgent` and applies
-/// project-overrides-global so the `SkillTool` resolves a name to the
-/// same entry the model sees in its catalog. Run at invocation time
-/// (not thread-build time) so skill changes after thread construction
-/// become visible without re-registering the tool.
+/// Build a project-wide resolver that includes global and worktree-root
+/// skills. Session tools use [`skills_resolver_for_session`] so they can
+/// also include the thread's active nested scopes.
 pub fn skills_resolver_for_project(
     weak_agent: WeakEntity<NativeAgent>,
     project_id: EntityId,
@@ -3691,12 +3775,36 @@ pub fn skills_resolver_for_project(
     }
 }
 
+pub fn skills_resolver_for_session(
+    weak_agent: WeakEntity<NativeAgent>,
+    session_id: acp::SessionId,
+) -> impl Fn(&App) -> Arc<Vec<Skill>> + Send + Sync + 'static {
+    move |cx: &App| {
+        let Some(agent) = weak_agent.upgrade() else {
+            return Arc::new(Vec::new());
+        };
+        let agent = agent.read(cx);
+        let Some(session) = agent.sessions.get(&session_id) else {
+            return Arc::new(Vec::new());
+        };
+        let Some(state) = agent.projects.get(&session.project_id) else {
+            return Arc::new(Vec::new());
+        };
+        let active_nested_scopes = session.thread.read(cx).active_skill_scopes();
+        Arc::new(effective_skills_for_thread(
+            &state.skills,
+            active_nested_scopes,
+        ))
+    }
+}
+
 pub fn skill_body_resolver_for_project(
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
 ) -> impl Fn(Skill, &mut AsyncApp) -> Task<Result<String>> + Send + Sync + 'static {
     move |skill, cx| match skill.source.clone() {
-        SkillSource::ProjectLocal { worktree_id, .. } => {
+        SkillSource::ProjectLocal { worktree_id, .. }
+        | SkillSource::ProjectLocalNested { worktree_id, .. } => {
             let project = project.clone();
             cx.spawn(async move |cx| {
                 let worktree_id = WorktreeId::from_usize(worktree_id.0);
@@ -3739,10 +3847,7 @@ pub fn skill_body_resolver_for_project(
 /// single list, preserving every entry — even when two skills share a
 /// name. The autocomplete popup shows the full list with origin labels
 /// so users can tell same-named skills apart; override resolution
-/// (project-local wins over global) happens later via
-/// [`apply_skill_overrides`] at the boundaries where the model
-/// interacts with skills (system-prompt catalog, `SkillTool` lookup,
-/// slash-command invocation).
+/// happens later at model and manual-invocation boundaries.
 ///
 /// Global versions of skills will be before the local versions
 fn combine_skills(
@@ -3771,21 +3876,14 @@ fn log_skill_conflicts(skills: &[Skill]) {
     for skill in skills {
         match by_name.get(skill.name.as_str()) {
             Some(existing) => {
+                log::warn!(
+                    "Skill '{}' at '{}' conflicts with skill at '{}'; thread scope and source precedence determine which version the model sees, but both appear in manual completion with their source",
+                    skill.name,
+                    skill.skill_file_path.display(),
+                    existing.skill_file_path.display(),
+                );
                 if skill.source.precedence() > existing.source.precedence() {
-                    log::warn!(
-                        "Skill '{}' at '{}' overrides skill at '{}' for the model; both appear in the slash-command popup with their source",
-                        skill.name,
-                        skill.skill_file_path.display(),
-                        existing.skill_file_path.display(),
-                    );
                     by_name.insert(skill.name.as_str(), skill);
-                } else {
-                    log::warn!(
-                        "Skill '{}' at '{}' conflicts with skill at '{}'; the model will see the first one, but both appear in the slash-command popup with their source",
-                        skill.name,
-                        skill.skill_file_path.display(),
-                        existing.skill_file_path.display(),
-                    );
                 }
             }
             None => {
@@ -3795,27 +3893,27 @@ fn log_skill_conflicts(skills: &[Skill]) {
     }
 }
 
-/// Project-local skills override same-named global skills. Returns a
-/// new list with at most one entry per name. Two skills of the same
-/// source colliding (e.g. two globals or two project-locals) keep the
-/// first one to match the historical behavior.
-///
-/// This is the projection of `state.skills` used by everything the
-/// model interacts with: the system-prompt catalog, the `SkillTool`'s
-/// name resolver, and slash-command invocation. The autocomplete popup
-/// deliberately does *not* go through this — it shows the full list so
-/// users can see what's shadowed.
+/// Return the baseline projection used when no nested scope is active.
+/// Project-root skills override same-named global and built-in skills;
+/// same-source collisions keep the first entry.
 fn apply_skill_overrides(skills: &[Skill]) -> Vec<Skill> {
+    effective_skills_for_thread(skills, &[])
+}
+
+fn effective_skills_for_thread(skills: &[Skill], active_nested_scopes: &[PathBuf]) -> Vec<Skill> {
     let mut result: Vec<Skill> = Vec::new();
-    // Borrow names from the input slice so the dedup index doesn't
-    // need to allocate a `String` per skill. The borrow is valid for
-    // the body of the function because `skills` outlives `indices`.
     let mut indices: HashMap<&str, usize> = HashMap::default();
     for skill in skills {
+        let Some(candidate_precedence) = effective_skill_precedence(skill, active_nested_scopes)
+        else {
+            continue;
+        };
         match indices.get(skill.name.as_str()).copied() {
-            Some(idx) => {
-                if skill.source.precedence() > result[idx].source.precedence() {
-                    result[idx] = skill.clone();
+            Some(index) => {
+                if effective_skill_precedence(&result[index], active_nested_scopes)
+                    .is_some_and(|current_precedence| candidate_precedence > current_precedence)
+                {
+                    result[index] = skill.clone();
                 }
             }
             None => {
@@ -3825,6 +3923,44 @@ fn apply_skill_overrides(skills: &[Skill]) -> Vec<Skill> {
         }
     }
     result
+}
+
+fn resolve_qualified_skill<'a>(skills: &'a [Skill], name: &str, scope: &str) -> Option<&'a Skill> {
+    skills
+        .iter()
+        .filter(|skill| skill.name == name && skill.source.matches_scope(scope))
+        .reduce(|best, candidate| {
+            if candidate.source.precedence() > best.source.precedence() {
+                candidate
+            } else {
+                best
+            }
+        })
+}
+
+fn effective_skill_precedence(
+    skill: &Skill,
+    active_nested_scopes: &[PathBuf],
+) -> Option<(u8, usize)> {
+    match &skill.source {
+        SkillSource::BuiltIn => Some((0, 0)),
+        SkillSource::Global => Some((1, 0)),
+        SkillSource::ProjectLocal { .. } => Some((2, 0)),
+        SkillSource::ProjectLocalNested { scope_path, .. } => active_nested_scopes
+            .iter()
+            .rposition(|active_scope| active_scope == scope_path)
+            .map(|position| (3, position)),
+    }
+}
+
+fn project_context_for_thread(
+    base_project_context: &ProjectContext,
+    skills: &[Skill],
+    active_nested_scopes: &[PathBuf],
+) -> ProjectContext {
+    let effective_skills = effective_skills_for_thread(skills, active_nested_scopes);
+    let (catalog_skills, _) = select_catalog_skills(&effective_skills);
+    base_project_context.clone().with_skills(catalog_skills)
 }
 
 #[cfg(test)]
@@ -4115,6 +4251,12 @@ mod internal_tests {
         assert_eq!(skill_qualified.prompt_name, "compact");
         assert_eq!(skill_qualified.skill_scope, Some(""));
         assert!(!skill_qualified.is_unqualified("compact"));
+
+        let nested_skill_blocks = [acp::ContentBlock::from("/zed/crates/agent:compact")];
+        let nested_skill = Command::parse(&nested_skill_blocks).unwrap();
+        assert_eq!(nested_skill.prompt_name, "compact");
+        assert_eq!(nested_skill.skill_scope, Some("zed/crates/agent"));
+        assert!(!nested_skill.is_unqualified("compact"));
     }
 
     fn make_project_skill(name: &str, description: &str, worktree: &str) -> Skill {
@@ -4127,6 +4269,30 @@ mod internal_tests {
             },
             directory_path: PathBuf::from(format!("/{worktree}/.agents/skills/{name}")),
             skill_file_path: PathBuf::from(format!("/{worktree}/.agents/skills/{name}/SKILL.md")),
+            load_warnings: Vec::new(),
+            disable_model_invocation: false,
+            embedded_body: None,
+        }
+    }
+
+    fn make_nested_project_skill(
+        name: &str,
+        description: &str,
+        worktree: &str,
+        scope: &str,
+    ) -> Skill {
+        let scope_path = PathBuf::from(format!("/{worktree}/{scope}"));
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            source: SkillSource::ProjectLocalNested {
+                worktree_id: SkillScopeId(1),
+                worktree_root_name: worktree.into(),
+                scope_path: scope_path.clone(),
+                scope_label: format!("{worktree}/{scope}").into(),
+            },
+            directory_path: scope_path.join(format!(".agents/skills/{name}")),
+            skill_file_path: scope_path.join(format!(".agents/skills/{name}/SKILL.md")),
             load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
@@ -4263,12 +4429,58 @@ mod internal_tests {
     }
 
     #[test]
+    fn test_effective_skills_follow_thread_scope_recency() {
+        let root = make_project_skill("review", "root", "zed");
+        let nested_a = make_nested_project_skill("review", "a", "zed", "a");
+        let nested_b = make_nested_project_skill("review", "b", "zed", "a/b");
+        let mut manual_only = make_nested_project_skill("deploy", "manual", "zed", "a/b");
+        manual_only.disable_model_invocation = true;
+        let skills = [root, nested_a, nested_b, manual_only];
+
+        let root_only = effective_skills_for_thread(&skills, &[]);
+        assert_eq!(root_only[0].description, "root");
+
+        let scope_a = PathBuf::from("/zed/a");
+        let scope_b = PathBuf::from("/zed/a/b");
+        let b_is_newest = effective_skills_for_thread(&skills, &[scope_a.clone(), scope_b.clone()]);
+        assert_eq!(b_is_newest[0].description, "b");
+
+        let a_is_newest = effective_skills_for_thread(&skills, &[scope_b, scope_a]);
+        assert_eq!(a_is_newest[0].description, "a");
+
+        let effective = effective_skills_for_thread(
+            &skills,
+            &[PathBuf::from("/zed/a"), PathBuf::from("/zed/a/b")],
+        );
+        assert!(effective.iter().any(|skill| skill.name == "deploy"));
+        let context = project_context_for_thread(
+            &ProjectContext::default(),
+            &skills,
+            &[PathBuf::from("/zed/a/b")],
+        );
+        assert!(context.skills().iter().all(|skill| skill.name != "deploy"));
+
+        let manual = resolve_qualified_skill(&skills, "deploy", "zed/a/b").unwrap();
+        assert!(manual.disable_model_invocation);
+    }
+
+    #[test]
+    fn test_qualified_global_skill_overrides_same_named_builtin() {
+        let builtin = make_builtin_skill("review", "built in");
+        let global = make_global_skill("review", "global");
+        let skills = [builtin, global];
+
+        let resolved = resolve_qualified_skill(&skills, "review", "").unwrap();
+        assert_eq!(resolved.description, "global");
+    }
+
+    #[test]
     fn test_skill_source_scope_prefix_and_matches_scope() {
-        // The popup inserts `/<prefix>:<name>` using `scope_prefix`,
-        // and the resolver routes via `matches_scope`. This test pins
-        // the contract that the two stay in sync.
+        // Typed `/<prefix>:<name>` commands use `scope_prefix`, and the
+        // resolver routes via `matches_scope`. This test pins the contract
+        // that the two stay in sync.
         let global = SkillSource::Global;
-        // Globals use an empty prefix, so the popup inserts `/:<name>`.
+        // Globals use an empty prefix, producing `/:<name>`.
         assert_eq!(global.scope_prefix(), "");
         assert!(global.matches_scope(""));
         // Hand-typed `/global:<name>` is not aliased to the global
@@ -4290,6 +4502,17 @@ mod internal_tests {
         // An unrelated worktree name (or MCP server name) must not
         // match a project skill from a different worktree.
         assert!(!project.matches_scope("extensions"));
+
+        let nested = SkillSource::ProjectLocalNested {
+            worktree_id: SkillScopeId(1),
+            worktree_root_name: "zed".into(),
+            scope_path: PathBuf::from("/zed/a/b"),
+            scope_label: "zed/a/b".into(),
+        };
+        assert_eq!(nested.display_label(), "zed/a/b");
+        assert_eq!(nested.scope_prefix(), "zed/a/b");
+        assert!(nested.matches_scope("zed/a/b"));
+        assert!(!nested.matches_scope("zed"));
 
         // A worktree literally named `global` is no longer ambiguous
         // with the global source: its skills are invoked as
@@ -5431,6 +5654,132 @@ mod internal_tests {
         cx.run_until_parked();
 
         (agent, project, worktree_id)
+    }
+
+    #[gpui::test]
+    async fn test_nested_project_skills_are_loaded_for_manual_invocation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".agents": {
+                    "skills": {
+                        "root-skill": {
+                            "SKILL.md": "---\nname: root-skill\ndescription: Root skill\n---\n\nroot body"
+                        }
+                    }
+                },
+                "a": {
+                    ".agents": {
+                        "skills": {
+                            "nested-skill": {
+                                "SKILL.md": "---\nname: nested-skill\ndescription: Nested skill\n---\n\nnested body"
+                            },
+                            "manual-only": {
+                                "SKILL.md": "---\nname: manual-only\ndescription: Manual only\ndisable-model-invocation: true\n---\n\nmanual body"
+                            }
+                        }
+                    },
+                    ".agent": {
+                        "skills": {
+                            "singular-skill": {
+                                "SKILL.md": "---\nname: singular-skill\ndescription: Must not load\n---\n\nsingular body"
+                            }
+                        }
+                    },
+                    "file.txt": "content"
+                }
+            }),
+        )
+        .await;
+
+        let (agent, project, _) = open_trusted_project_skills(cx, fs, "/project").await;
+
+        let session_id = agent.read_with(cx, |agent, cx| {
+            let state = agent.projects.get(&project.entity_id()).unwrap();
+            let skills = user_skills(&state.skills);
+            let root_skill = skills
+                .iter()
+                .find(|skill| skill.name == "root-skill")
+                .expect("root skill should be loaded");
+            let nested_skill = skills
+                .iter()
+                .find(|skill| skill.name == "nested-skill")
+                .expect("nested skill should be loaded");
+
+            assert_eq!(root_skill.source.display_label(), "project");
+            assert_eq!(nested_skill.source.display_label(), "project/a");
+
+            let catalog_names = state
+                .project_context
+                .read(cx)
+                .skills()
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(catalog_names.contains(&"root-skill"));
+            assert!(!catalog_names.contains(&"nested-skill"));
+            assert!(!catalog_names.contains(&"manual-only"));
+
+            agent.sessions.keys().next().cloned().unwrap()
+        });
+
+        cx.update(|cx| {
+            let connection = NativeAgentConnection(agent.clone());
+            let available_skills = connection.available_skills(&session_id, cx);
+            let nested_skill = available_skills
+                .iter()
+                .find(|skill| skill.name == "nested-skill")
+                .expect("inactive nested skill should be available for manual invocation");
+            assert_eq!(nested_skill.source.as_ref(), "project/a");
+            assert_eq!(nested_skill.scope.as_ref(), "project/a");
+            assert_eq!(
+                nested_skill.skill_file_path,
+                PathBuf::from("/project/a/.agents/skills/nested-skill/SKILL.md")
+            );
+            assert!(
+                available_skills
+                    .iter()
+                    .any(|skill| skill.name == "manual-only"),
+                "disable-model-invocation must not hide a nested skill from manual invocation"
+            );
+            assert!(
+                available_skills
+                    .iter()
+                    .all(|skill| skill.name != "singular-skill"),
+                "only plural .agents/skills directories should be discovered"
+            );
+        });
+
+        let thread = agent.read_with(cx, |agent, _cx| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+        thread.update(cx, |thread, cx| {
+            thread.activate_skill_scopes_for_path(Path::new("a/file.txt"), false, cx);
+        });
+
+        cx.update(|cx| {
+            let catalog_names = thread
+                .read(cx)
+                .project_context()
+                .read(cx)
+                .skills()
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(catalog_names.contains(&"root-skill"));
+            assert!(catalog_names.contains(&"nested-skill"));
+            assert!(!catalog_names.contains(&"manual-only"));
+
+            let resolve = skills_resolver_for_session(agent.downgrade(), session_id.clone());
+            let effective_skills = resolve(cx);
+            assert!(
+                effective_skills
+                    .iter()
+                    .any(|skill| skill.name == "nested-skill")
+            );
+        });
     }
 
     /// The body resolver for a project-local skill must read the file
