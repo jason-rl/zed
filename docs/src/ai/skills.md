@@ -7,7 +7,7 @@ description: Extend Zed's AI agent with reusable, on-demand skill files for spec
 
 Skills are reusable instruction packages that give the agent specialized knowledge for specific tasks: test-driven development workflows, document processing, database integrations, or your team's internal coding standards.
 
-A skill is a folder containing a `SKILL.md` file with metadata and instructions. The agent sees a catalog of all installed skills and can load one on demand, or you can invoke any skill directly from the message editor with a slash command.
+A skill is a folder containing a `SKILL.md` file with metadata and instructions. The agent sees a catalog of all applicable skills and can load one on demand, or you can invoke any installed skill directly from the message editor with a slash command or @-mention.
 
 ## Adding Skills {#adding-skills}
 
@@ -29,13 +29,13 @@ See [Skill format](#skill-format) below for the full format reference.
 - [`frontend-design`](https://skills.sh/anthropics/skills/frontend-design): production-grade frontend interfaces with design polish
 - [`pdf`](https://skills.sh/anthropics/skills/pdf): PDF text extraction, merging, splitting, form filling, and OCR
 
-To install a skill, copy the skill's folder into `~/.agents/skills/` for global use, or into your project's `.agents/skills/` folder for project-local use.
+To install a skill, copy the skill's folder into `~/.agents/skills/` for global use, into your project's root `.agents/skills/` folder for project-wide use, or into `<directory>/.agents/skills/` for use when the agent works in that directory.
 
 ## Managing Skills {#managing-skills}
 
 Open the Settings Editor (`Cmd+,` on macOS, `Ctrl+,` on Linux/Windows) and navigate to **AI > Skills**, or go directly to [agent.skills](zed://settings/agent.skills).
 
-The **User** tab shows your global skills, and each **Project** tab shows the skills for that project.
+The **User** tab shows your global skills, and each **Project** tab shows all root and nested skills for that project. Nested skills include their directory scope next to the skill name.
 
 For each skill you can:
 
@@ -56,7 +56,9 @@ Nothing is written to disk until they explicitly save, so a shared link can neve
 
 ## Using Skills {#using-skills}
 
-By default, the agent picks up skills autonomously. It sees a catalog of every installed skill (name and description) in its system prompt, and calls the `skill` tool when a task matches a skill's description.
+By default, the agent picks up applicable skills autonomously. Global skills and skills at a worktree root are always applicable. A nested skill becomes applicable to a thread after a successful `read_file`, `list_directory`, `edit_file`, or `write_file` call within its directory. Reading a file in a deeper directory activates every ancestor directory scope; search and terminal commands do not activate scopes.
+
+Nested scope activation lasts for the thread and is restored when the thread is reopened. A subagent inherits the parent's active scopes when it is created, then tracks any later activation independently.
 
 When the agent invokes a skill you created or installed, Zed prompts you to allow or deny it, using the same permission flow as other tools. Skills built into Zed do not prompt. You can set per-skill defaults in [Tool Permissions](./tool-permissions.md) so you're not prompted for skills you always trust.
 
@@ -69,10 +71,12 @@ You can also load a skill manually:
 
 Both inject the skill's instructions as context. The loaded skill appears as a crease button in the thread, which you can click to open the skill file.
 
+Manual completion lists every installed skill in trusted worktrees, including nested skills that are not active for autonomous use. It uses the exact `SKILL.md` path, so selecting a nested skill loads that specific file without activating its directory scope. When same-named skills need disambiguation, slash commands can be qualified by their displayed scope, such as `/zed:review` for a worktree-root skill, `/zed/crates/agent:review` for a nested skill, or `/:review` for a global skill. An unqualified `/review` uses the same effective precedence as the current thread.
+
 ### Preventing Autonomous Invocation {#disable-model-invocation}
 
 Add `disable-model-invocation: true` to a skill's frontmatter to stop the agent from picking it up autonomously.
-The skill still appears as a slash command, so you stay in control of when it runs.
+The skill still appears in both slash-command and @-mention completion, including when it is nested, so you stay in control of when it runs.
 
 This is useful for workflows you don't want the agent triggering automatically, like deploy or release procedures.
 
@@ -165,24 +169,27 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 
 ## Where Skills Live {#where-skills-live}
 
-Zed loads skills from two locations:
+Zed loads skills from these locations:
 
-| Scope         | Path                         | When it applies          |
-| ------------- | ---------------------------- | ------------------------ |
-| Global        | `~/.agents/skills/`          | Every project            |
-| Project-local | `<worktree>/.agents/skills/` | Only the current project |
+| Scope          | Path                                     | When it applies                                      |
+| -------------- | ---------------------------------------- | ---------------------------------------------------- |
+| Global         | `~/.agents/skills/`                      | Every project                                        |
+| Project root   | `<worktree>/.agents/skills/`             | Every thread in the current project                  |
+| Project nested | `<worktree>/<directory>/.agents/skills/` | After a successful native file-tool access in `<directory>` |
 
-Each skill is a direct child of the skills root. Nesting skills inside subfolders is not supported.
+The directory name is plural: `.agent/skills/` is not discovered.
+
+Each skill remains a direct child of its nearest `skills` directory. Grouping folders inside a `skills` directory are not discovered.
 
 ### Project-local Skills and Trust {#project-local-trust}
 
-Project-local skills only load from [trusted worktrees](../worktree-trust.md). Skills from a freshly cloned or untrusted project are excluded from the catalog and slash commands until you grant trust.
+Project-local skills, including nested skills, only load from [trusted worktrees](../worktree-trust.md). Skills from a freshly cloned or untrusted project are excluded from the catalog and manual completion until you grant trust. Revoking trust removes them immediately; any remembered thread scopes become effective again if the worktree is trusted later.
 
 This prevents a malicious project from injecting instructions into your agent's system prompt before you've reviewed what the project ships.
 
 ### Override Behavior {#override-behavior}
 
-If a global and a project-local skill share the same name, the project-local skill takes precedence. This lets a project customize or replace a global skill for its own context.
+If a global and a project-root skill share the same name, the project skill takes precedence. Active nested skills take precedence over both, and the most recently activated nested scope wins among same-named nested skills. A single access activates ancestor scopes from shallowest to deepest, so the deepest matching scope is newest. Manually revisiting an ancestor makes that ancestor newest.
 
 ### Editing Skill Files {#editing-skill-files}
 
@@ -194,10 +201,10 @@ Zed Skills apply to the Zed Agent. External Agents and Terminal Threads may have
 
 ## Limitations {#limitations}
 
-- **Flat layout only.** Skills must be direct children of the skills root. Nested folders like `~/.agents/skills/group/my-skill/` are not discovered.
-- **50KB catalog budget.** The total size of all skill names and descriptions is capped at 50KB. Skills that don't fit are dropped from the catalog with a warning in the UI. Keep descriptions concise.
-- **No remote registry.** Zed does not discover or load skills from remote locations at runtime, and custom search paths are not supported. (You can still import a skill once from a GitHub URL — see [Create your own](#create-your-own).) Skills are loaded from `~/.agents/skills/` and `<worktree>/.agents/skills/` only. Use a symlink if you need to point at another location.
-- **Live reload.** Adding, removing, or editing a `SKILL.md` takes effect immediately without restarting your session. Changes to a skill's `name` or `description` invalidate the model's prompt cache for the current session.
+- **One level per skills directory.** Skills must be direct children of a `skills` directory. Grouping folders like `~/.agents/skills/group/my-skill/` or `<directory>/.agents/skills/group/my-skill/` are not discovered.
+- **50KB catalog budget.** The total size of applicable skill names and descriptions is capped at 50KB. Skills that don't fit are dropped from the catalog. Keep descriptions concise.
+- **No remote registry.** Zed does not discover or load skills from remote registries at runtime, and custom search paths are not supported. (You can still import a skill once from a GitHub URL — see [Create your own](#create-your-own).) Skills are loaded from `~/.agents/skills/` and `.agents/skills/` directories within trusted worktrees. Use a symlink if you need to point at another location.
+- **Live reload.** Adding, removing, or editing a `SKILL.md` takes effect immediately without restarting your session. Changes to an applicable skill's `name` or `description` invalidate the model's prompt cache for the current session.
 
 ## See also
 

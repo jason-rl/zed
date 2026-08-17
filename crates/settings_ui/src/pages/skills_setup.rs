@@ -117,11 +117,16 @@ fn render_skill_row(
     let skill_file_path = skill.skill_file_path.clone();
     let directory_path = skill.directory_path.clone();
     let skill_name = skill.name.clone();
+    let skill_id = skill.directory_path.to_string_lossy();
 
     let (skill_scope, shared_scope) = match &skill.source {
-        SkillSource::ProjectLocal { .. } => ("project", "used in this project"),
+        SkillSource::ProjectLocal { .. } | SkillSource::ProjectLocalNested { .. } => {
+            ("project", "used in this project")
+        }
         _ => ("global", "on this machine"),
     };
+    let nested_scope_label = matches!(&skill.source, SkillSource::ProjectLocalNested { .. })
+        .then(|| skill.source.display_label().to_string());
 
     let share_copied = settings_window.last_copied_skill_directory_path.as_deref()
         == Some(skill.directory_path.as_path());
@@ -133,7 +138,7 @@ fn render_skill_row(
         (IconName::Link, Color::Muted)
     };
 
-    let group = format!("group-{}", skill.name);
+    let group = format!("group-{skill_id}");
 
     let title = h_flex()
         .ml(rems_from_px(-22.0_f32))
@@ -141,50 +146,54 @@ fn render_skill_row(
         .child({
             let share_skill_file_path = skill.skill_file_path.clone();
             let share_directory_path = skill.directory_path.clone();
-            IconButton::new(
-                SharedString::from(format!("share-{}", skill.name)),
-                share_icon,
-            )
-            .tab_index(0_isize)
-            .shape(ui::IconButtonShape::Square)
-            .icon_size(IconSize::Small)
-            .icon_color(share_icon_color)
-            .tooltip(Tooltip::text("Copy Share Link"))
-            .visible_on_hover(&group)
-            .on_click(cx.listener(move |_settings_window, _event, _window, cx| {
-                let skill_file_path = share_skill_file_path.clone();
-                let directory_path = share_directory_path.clone();
-                let app_state = workspace::AppState::global(cx);
-                let fs = app_state.fs.clone();
-                cx.spawn(
-                    async move |settings_window, cx| match fs.load(&skill_file_path).await {
-                        Ok(content) => {
-                            let link = encode_skill_share_link(&content);
-                            settings_window
-                                .update(cx, |settings_window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(link));
-                                    settings_window.last_copied_skill_directory_path =
-                                        Some(directory_path.clone());
-                                    cx.notify();
-                                })
-                                .ok();
+            IconButton::new(SharedString::from(format!("share-{skill_id}")), share_icon)
+                .tab_index(0_isize)
+                .shape(ui::IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .icon_color(share_icon_color)
+                .tooltip(Tooltip::text("Copy Share Link"))
+                .visible_on_hover(&group)
+                .on_click(cx.listener(move |_settings_window, _event, _window, cx| {
+                    let skill_file_path = share_skill_file_path.clone();
+                    let directory_path = share_directory_path.clone();
+                    let app_state = workspace::AppState::global(cx);
+                    let fs = app_state.fs.clone();
+                    cx.spawn(async move |settings_window, cx| {
+                        match fs.load(&skill_file_path).await {
+                            Ok(content) => {
+                                let link = encode_skill_share_link(&content);
+                                settings_window
+                                    .update(cx, |settings_window, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(link));
+                                        settings_window.last_copied_skill_directory_path =
+                                            Some(directory_path.clone());
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "failed to read skill file {} for sharing: {error:#}",
+                                    skill_file_path.display()
+                                );
+                            }
                         }
-                        Err(error) => {
-                            log::error!(
-                                "failed to read skill file {} for sharing: {error:#}",
-                                skill_file_path.display()
-                            );
-                        }
-                    },
-                )
-                .detach();
-            }))
+                    })
+                    .detach();
+                }))
         })
         .child(Label::new(skill.name.clone()))
+        .when_some(nested_scope_label, |this, scope_label| {
+            this.child(
+                Label::new(scope_label)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+        })
         .when_some(warning_message, |this, warning_message| {
             this.child(
                 h_flex()
-                    .id(SharedString::from(format!("warning-{}", skill.name)))
+                    .id(SharedString::from(format!("warning-{skill_id}")))
                     .child(
                         Icon::new(IconName::Warning)
                             .size(IconSize::XSmall)
@@ -214,7 +223,7 @@ fn render_skill_row(
                 .gap_2()
                 .child(
                     IconButton::new(
-                        SharedString::from(format!("delete-{}", skill.name)),
+                        SharedString::from(format!("delete-{skill_id}")),
                         IconName::Trash,
                     )
                     .tab_index(0_isize)
