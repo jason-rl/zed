@@ -767,9 +767,8 @@ impl MessageEditor {
                 //    (`/github.create_pr`), and skills (whose bare name
                 //    is registered for the unqualified `/<name>` form).
                 //
-                // 2. Trusted native skill scope qualifier `/<scope>:<name>`. The popup
-                //    inserts this colon-separated form to disambiguate
-                //    same-named skills, so the validator splits on the
+                // 2. A typed native skill scope qualifier `/<scope>:<name>`.
+                //    The validator splits this colon-separated form on the
                 //    LAST `:` to recover scope + bare name. Skill
                 //    names are restricted to `[a-z0-9-]+` (no colons),
                 //    so the rightmost colon is always the scope/name
@@ -780,11 +779,10 @@ impl MessageEditor {
                 //    `SkillSource::scope_prefix`). The validator then
                 //    checks the `available_skills` slice for an entry
                 //    whose `skill.name` matches the bare name and
-                //    whose `skill.source` equals the typed scope
+                //    whose `skill.scope` equals the typed scope
                 //    (including empty for globals). Without this
-                //    branch, every autocomplete pick of a same-named
-                //    skill would be rejected as "not supported"
-                //    before reaching the resolver.
+                //    branch, typed qualifiers would be rejected as "not
+                //    supported" before reaching the resolver.
                 let direct_match = available_commands
                     .iter()
                     .any(|available_command| available_command.name == command_name)
@@ -795,7 +793,7 @@ impl MessageEditor {
                     && command_name.rsplit_once(':').is_some_and(|(scope, bare)| {
                         !bare.is_empty()
                             && available_skills.iter().any(|skill| {
-                                skill.name.as_ref() == bare && skill.source.as_ref() == scope
+                                skill.name.as_ref() == bare && skill.scope.as_ref() == scope
                             })
                     });
 
@@ -819,9 +817,9 @@ impl MessageEditor {
 
     /// Render the available-commands list for error messages. Trusted native skills
     /// are shown in their qualified `/<scope>:<name>` form so users
-    /// see the exact text the popup would insert — otherwise the
-    /// listing would contain confusing duplicates like `/foo, /foo`
-    /// when both a global and a project-local skill share a name.
+    /// see an unambiguous form rather than confusing duplicates like
+    /// `/foo, /foo` when both a global and a project-local skill share
+    /// a name.
     /// Globals carry an empty scope and so render as `/:<name>`.
     fn format_available_commands(
         commands: &[acp::AvailableCommand],
@@ -832,7 +830,7 @@ impl MessageEditor {
         }
         skills
             .iter()
-            .map(|skill| format!("/{}:{}", skill.source, skill.name))
+            .map(|skill| format!("/{}:{}", skill.scope, skill.name))
             .chain(commands.iter().map(|command| format!("/{}", command.name)))
             .collect::<Vec<_>>()
             .join(", ")
@@ -2288,7 +2286,8 @@ mod tests {
         let skill = AvailableSkill {
             name: "deploy".into(),
             description: "Deploy the app".into(),
-            source: "".into(),
+            source: "global".into(),
+            scope: "".into(),
             skill_file_path: skill_file_path.clone(),
             warning: None,
         };
@@ -2342,20 +2341,26 @@ mod tests {
     #[test]
     fn test_validate_slash_commands_accepts_scope_qualified_skill() {
         let agent_id = AgentId::from("Zed");
-        let make_skill = |name: &str, source: &str| AvailableSkill {
+        let make_skill = |name: &str, scope: &str| AvailableSkill {
             name: name.into(),
             description: "desc".into(),
-            source: source.into(),
-            skill_file_path: PathBuf::from(format!("/tmp/{source}-{name}/SKILL.md")),
+            source: if scope.is_empty() { "global" } else { scope }.into(),
+            scope: scope.into(),
+            skill_file_path: PathBuf::from(format!("/tmp/{scope}-{name}/SKILL.md")),
             warning: None,
         };
 
         // Global skills carry an empty scope (so the popup inserts
         // `/:<name>`); project-local skills carry their worktree root
-        // name. The empty-scope encoding means a worktree literally
-        // named `global` no longer collides with the global source.
+        // name or nested directory label. The empty-scope encoding means
+        // a worktree literally named `global` no longer collides with the
+        // global source.
         let commands = vec![acp::AvailableCommand::new("help", "Get help")];
-        let skills = vec![make_skill("deploy", ""), make_skill("deploy", "zed")];
+        let skills = vec![
+            make_skill("deploy", ""),
+            make_skill("deploy", "zed"),
+            make_skill("deploy", "zed/crates/agent"),
+        ];
         let no_skills = Vec::new();
 
         // Bare name still works (current behavior — the resolver
@@ -2374,6 +2379,13 @@ mod tests {
         MessageEditor::validate_slash_commands("/zed:deploy", &commands, &skills, &agent_id).expect(
             "/zed:deploy should validate when a project skill named `deploy` exists in the `zed` worktree",
         );
+        MessageEditor::validate_slash_commands(
+            "/zed/crates/agent:deploy",
+            &commands,
+            &skills,
+            &agent_id,
+        )
+        .expect("nested project skill qualifiers should allow directory separators");
 
         // Hand-typed `/global:<name>` is NOT an alias for `/:<name>`.
         // It looks for a project-local skill from a worktree named
