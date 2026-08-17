@@ -81,6 +81,10 @@ pub struct DbThread {
     pub ui_scroll_position: Option<SerializedScrollPosition>,
     #[serde(default)]
     pub sandboxed_terminal_temp_dir: Option<PathBuf>,
+    /// Nested project directories whose agent skill scopes were activated by
+    /// successful native file-tool access, ordered from least to most recent.
+    #[serde(default)]
+    pub active_skill_scopes: Vec<PathBuf>,
     /// Sandbox escalations the user approved "for the rest of this thread".
     /// Persisted so reopening a thread keeps its grants. See
     /// [`crate::sandboxing::ThreadSandboxGrants`].
@@ -168,6 +172,7 @@ impl SharedThread {
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
+            active_skill_scopes: Vec::new(),
             sandbox_grants: DbSandboxGrants::default(),
         }
     }
@@ -354,6 +359,7 @@ impl DbThread {
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
+            active_skill_scopes: Vec::new(),
             sandbox_grants: DbSandboxGrants::default(),
         })
     }
@@ -825,6 +831,7 @@ mod tests {
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
+            active_skill_scopes: Vec::new(),
             sandbox_grants: DbSandboxGrants::default(),
         }
     }
