@@ -1693,6 +1693,10 @@ impl AgentConnection for AcpConnection {
         })
     }
 
+    fn refresh_session_before_first_prompt(&self) -> bool {
+        true
+    }
+
     fn supports_load_session(&self) -> bool {
         self.agent_capabilities.load_session
     }
@@ -2242,6 +2246,10 @@ pub mod test_support {
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
             self.inner.clone().new_session(project, work_dirs, cx)
+        }
+
+        fn refresh_session_before_first_prompt(&self) -> bool {
+            self.inner.refresh_session_before_first_prompt()
         }
 
         fn supports_load_session(&self) -> bool {
