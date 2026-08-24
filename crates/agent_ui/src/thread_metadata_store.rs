@@ -345,7 +345,7 @@ impl PersistedAcpSessionOptions {
         }
     }
 
-    fn capture(
+    pub(crate) fn capture(
         session_modes: Option<Rc<dyn acp_thread::AgentSessionModes>>,
         config_options: Option<Rc<dyn acp_thread::AgentSessionConfigOptions>>,
     ) -> Option<Self> {

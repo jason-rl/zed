@@ -104,6 +104,12 @@ pub trait AgentConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>>;
 
+    /// Whether a newly-created draft session should be recreated immediately before its first
+    /// prompt so immutable session initialization data is resolved at submission time.
+    fn refresh_session_before_first_prompt(&self) -> bool {
+        false
+    }
+
     /// Whether this agent supports loading existing sessions.
     fn supports_load_session(&self) -> bool {
         false
