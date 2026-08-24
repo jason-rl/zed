@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServerDelegate;
 use agent_servers::{AgentServer, GEMINI_TERMINAL_AUTH_METHOD_ID};
 use agent_settings::{AgentProfileId, AgentSettings};
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;
@@ -88,7 +88,7 @@ use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
+use crate::thread_metadata_store::{PersistedAcpSessionOptions, ThreadId, ThreadMetadataStore};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
@@ -1090,6 +1090,7 @@ impl ConversationView {
             });
 
         let connect_result = connection_entry.read(cx).wait_for_connection();
+        let is_new_session = resume_session_id.is_none();
         let persisted_session_options = resume_session_id.as_ref().and_then(|_| {
             ThreadMetadataStore::try_global(cx).and_then(|store| {
                 store
@@ -1228,6 +1229,7 @@ impl ConversationView {
                             conversation.clone(),
                             resumed_without_history,
                             initial_content,
+                            is_new_session,
                             window,
                             cx,
                         );
@@ -1279,12 +1281,152 @@ impl ConversationView {
         }
     }
 
+    fn refresh_draft_session_before_first_prompt(
+        &mut self,
+        expected_thread: Entity<AcpThread>,
+        connection: Rc<dyn AgentConnection>,
+        work_dirs: PathList,
+        session_options: Option<PersistedAcpSessionOptions>,
+        draft_contents: Task<Result<Vec<acp::ContentBlock>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let expected_session_id = expected_thread.read(cx).session_id().clone();
+        let should_restore_focus = self.focus_handle.contains_focused(window, cx);
+        let new_thread_task = connection
+            .clone()
+            .new_session(self.project.clone(), work_dirs, cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let draft_contents = draft_contents
+                .await
+                .context("failed to resolve the agent draft")?;
+            if draft_contents.is_empty() {
+                return Err(anyhow!("Agent draft is empty"));
+            }
+
+            let new_thread = new_thread_task
+                .await
+                .context("failed to create replacement ACP session")?;
+            let new_session_id =
+                new_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+
+            if let Some(session_options) = session_options {
+                let restore_task = cx
+                    .update(|_, cx| {
+                        session_options.restore(
+                            connection.session_modes(&new_session_id, cx),
+                            connection.session_config_options(&new_session_id, cx),
+                            cx,
+                        )
+                    })
+                    .context("failed to prepare restored ACP session options")?;
+                restore_task.await;
+            }
+
+            let install_result = cx.update(|window, cx| {
+                this.update(cx, |this, cx| -> Result<_> {
+                    let Some(current_thread) = this.root_thread(cx) else {
+                        return Err(anyhow!("Agent draft session is no longer available"));
+                    };
+                    if current_thread.entity_id() != expected_thread.entity_id()
+                        || current_thread
+                            .read(cx)
+                            .entries()
+                            .iter()
+                            .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    {
+                        return Err(anyhow!("Agent draft session changed before submission"));
+                    }
+
+                    let conversation = cx.new(|cx| {
+                        let mut conversation = Conversation::default();
+                        conversation.register_thread(new_thread.clone(), cx);
+                        conversation
+                    });
+                    let new_view = this.new_thread_view(
+                        new_thread,
+                        conversation.clone(),
+                        false,
+                        Some(AgentInitialContent::ContentBlock {
+                            blocks: draft_contents,
+                            auto_submit: true,
+                        }),
+                        false,
+                        window,
+                        cx,
+                    );
+
+                    if should_restore_focus {
+                        new_view
+                            .read(cx)
+                            .message_editor
+                            .focus_handle(cx)
+                            .focus(window, cx);
+                    }
+
+                    let Some(connected) = this.as_connected_mut() else {
+                        return Err(anyhow!("Agent connection is no longer available"));
+                    };
+                    connected.active_id = Some(new_session_id.clone());
+                    connected.threads.clear();
+                    connected.threads.insert(new_session_id.clone(), new_view);
+                    connected.conversation = conversation;
+                    this.root_session_id = Some(new_session_id.clone());
+
+                    cx.emit(StateChange);
+                    cx.emit(AcpServerViewEvent::ActiveThreadChanged);
+                    cx.emit(RootThreadUpdated);
+                    cx.notify();
+
+                    Ok(connection
+                        .supports_close_session()
+                        .then(|| connection.clone().close_session(&expected_session_id, cx)))
+                })
+            });
+            let install_result = match install_result {
+                Ok(Ok(install_result)) => {
+                    install_result.context("failed to install replacement ACP session")
+                }
+                Ok(Err(error)) => Err(error.context("failed to update the agent thread")),
+                Err(error) => Err(error.context("failed to access the agent thread window")),
+            };
+            let close_old_session = match install_result {
+                Ok(close_old_session) => close_old_session,
+                Err(error) => {
+                    if connection.supports_close_session()
+                        && let Some(close_new_session) = cx
+                            .update(|_, cx| connection.clone().close_session(&new_session_id, cx))
+                            .log_err()
+                        && let Err(close_error) = close_new_session.await
+                    {
+                        log::error!(
+                            "Failed to close unused ACP session {new_session_id}: {close_error:#}"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+
+            if let Some(close_old_session) = close_old_session
+                && let Err(error) = close_old_session.await
+            {
+                log::error!(
+                    "Failed to close superseded ACP session {expected_session_id}: {error:#}"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
     fn new_thread_view(
         &self,
         thread: Entity<AcpThread>,
         conversation: Entity<Conversation>,
         resumed_without_history: bool,
         initial_content: Option<AgentInitialContent>,
+        allow_draft_session_refresh: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ThreadView> {
@@ -1473,6 +1615,7 @@ impl ConversationView {
                 self.code_span_resolver.clone(),
                 self.thread_store.clone(),
                 initial_content,
+                allow_draft_session_refresh,
                 subscriptions,
                 window,
                 cx,
@@ -2130,8 +2273,15 @@ impl ConversationView {
                 conversation.update(cx, |conversation, cx| {
                     conversation.register_thread(subagent_thread.clone(), cx);
                 });
-                let view =
-                    this.new_thread_view(subagent_thread, conversation, false, None, window, cx);
+                let view = this.new_thread_view(
+                    subagent_thread,
+                    conversation,
+                    false,
+                    None,
+                    false,
+                    window,
+                    cx,
+                );
                 let Some(connected) = this.as_connected_mut() else {
                     return;
                 };
@@ -5869,6 +6019,467 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    #[derive(Default)]
+    struct DraftRefreshingConnectionState {
+        current_setting: String,
+        new_session_settings: Vec<String>,
+        new_session_work_dirs: Vec<PathList>,
+        prompts: Vec<(acp::SessionId, String)>,
+        closed_sessions: Vec<acp::SessionId>,
+        session_modes: HashMap<acp::SessionId, acp::SessionModeId>,
+        fail_session_creation: Option<usize>,
+        emit_initialization_tool_call: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct DraftRefreshingConnection {
+        state: Arc<Mutex<DraftRefreshingConnectionState>>,
+    }
+
+    struct DraftRefreshingSessionModes {
+        session_id: acp::SessionId,
+        state: Arc<Mutex<DraftRefreshingConnectionState>>,
+    }
+
+    impl acp_thread::AgentSessionModes for DraftRefreshingSessionModes {
+        fn current_mode(&self) -> acp::SessionModeId {
+            self.state
+                .lock()
+                .session_modes
+                .get(&self.session_id)
+                .cloned()
+                .unwrap_or_else(|| acp::SessionModeId::new("ask"))
+        }
+
+        fn all_modes(&self) -> Vec<acp::SessionMode> {
+            vec![
+                acp::SessionMode::new("ask", "Ask"),
+                acp::SessionMode::new("plan", "Plan"),
+            ]
+        }
+
+        fn set_mode(&self, mode: acp::SessionModeId, _cx: &mut App) -> Task<gpui::Result<()>> {
+            self.state
+                .lock()
+                .session_modes
+                .insert(self.session_id.clone(), mode);
+            Task::ready(Ok(()))
+        }
+    }
+
+    impl AgentConnection for DraftRefreshingConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("draft-refreshing")
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "draft-refreshing".into()
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let (session_id, should_fail, emit_initialization_tool_call) = {
+                let mut state = self.state.lock();
+                let setting = state.current_setting.clone();
+                state.new_session_settings.push(setting);
+                state.new_session_work_dirs.push(work_dirs.clone());
+                let session_number = state.new_session_settings.len();
+                let session_id = acp::SessionId::new(format!("session-{session_number}"));
+                let should_fail = state.fail_session_creation == Some(session_number);
+                if !should_fail {
+                    state
+                        .session_modes
+                        .insert(session_id.clone(), acp::SessionModeId::new("ask"));
+                }
+                (session_id, should_fail, state.emit_initialization_tool_call)
+            };
+
+            if should_fail {
+                return Task::ready(Err(anyhow!("session creation failed")));
+            }
+
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            let thread = cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    None,
+                    Some(work_dirs),
+                    self,
+                    project,
+                    action_log,
+                    session_id,
+                    watch::Receiver::constant(acp::PromptCapabilities::new()),
+                    cx,
+                )
+            });
+            if emit_initialization_tool_call {
+                add_failed_initialization_tool_call(&thread, cx);
+            }
+            Task::ready(Ok(thread))
+        }
+
+        fn refresh_session_before_first_prompt(&self) -> bool {
+            true
+        }
+
+        fn supports_close_session(&self) -> bool {
+            true
+        }
+
+        fn close_session(
+            self: Rc<Self>,
+            session_id: &acp::SessionId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            self.state.lock().closed_sessions.push(session_id.clone());
+            Task::ready(Ok(()))
+        }
+
+        fn auth_methods(&self) -> &[acp::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn prompt(
+            &self,
+            params: acp::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<acp::PromptResponse>> {
+            let mut state = self.state.lock();
+            let mode = state
+                .session_modes
+                .get(&params.session_id)
+                .map(|mode| mode.0.to_string())
+                .unwrap_or_default();
+            state.prompts.push((params.session_id, mode));
+            Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+        }
+
+        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+
+        fn session_modes(
+            &self,
+            session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionModes>> {
+            Some(Rc::new(DraftRefreshingSessionModes {
+                session_id: session_id.clone(),
+                state: self.state.clone(),
+            }))
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    fn add_failed_initialization_tool_call(thread: &Entity<AcpThread>, cx: &mut App) {
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new("mcp_startup.test", "Failed to start MCP server")
+                            .kind(acp::ToolKind::Fetch)
+                            .status(acp::ToolCallStatus::Failed),
+                    ),
+                    cx,
+                )
+            })
+            .expect("initialization tool call should be accepted");
+    }
+
+    #[gpui::test]
+    async fn test_refreshes_draft_session_before_first_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = DraftRefreshingConnection::default();
+        connection.state.lock().current_setting = "initial".to_string();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let initial_thread = conversation_view
+            .read_with(cx, |view, cx| view.root_thread(cx))
+            .expect("initial thread should be installed");
+        cx.update(|_, cx| add_failed_initialization_tool_call(&initial_thread, cx));
+        cx.run_until_parked();
+
+        let initial_session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _cx| view.session_id.clone());
+        let set_mode = cx.update(|_, cx| {
+            connection
+                .session_modes(&initial_session_id, cx)
+                .expect("test connection should expose session modes")
+                .set_mode(acp::SessionModeId::new("plan"), cx)
+        });
+        set_mode
+            .await
+            .expect("setting the draft mode should succeed");
+
+        connection.state.lock().current_setting = "updated".to_string();
+        let updated_work_dirs = PathList::new(&[Path::new("/updated")]);
+        conversation_view.update(cx, |view, cx| {
+            view.set_work_dirs(updated_work_dirs.clone(), cx);
+        });
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Use the latest settings", window, cx);
+        });
+        assert!(
+            !message_editor(&conversation_view, cx).read_with(cx, |editor, cx| editor.is_empty(cx))
+        );
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, _cx| {
+            assert!(
+                view.thread_error.is_none(),
+                "refresh failed with {:?}",
+                view.thread_error
+            );
+        });
+
+        let state = connection.state.lock();
+        assert_eq!(
+            state.new_session_settings,
+            ["initial".to_string(), "updated".to_string()]
+        );
+        assert_eq!(
+            state
+                .new_session_work_dirs
+                .get(1)
+                .expect("replacement work directories should be captured"),
+            &updated_work_dirs
+        );
+        assert_eq!(
+            state.prompts,
+            [(acp::SessionId::new("session-2"), "plan".to_string())]
+        );
+        assert_eq!(state.closed_sessions, [initial_session_id]);
+        drop(state);
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread(cx)
+                    .expect("replacement thread should be installed")
+                    .read(cx)
+                    .session_id(),
+                &acp::SessionId::new("session-2")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_refreshes_draft_session_with_preloaded_initialization_entry(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = DraftRefreshingConnection::default();
+        {
+            let mut state = connection.state.lock();
+            state.current_setting = "initial".to_string();
+            state.emit_initialization_tool_call = true;
+        }
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        connection.state.lock().emit_initialization_tool_call = false;
+
+        let initial_thread = conversation_view
+            .read_with(cx, |view, cx| view.root_thread(cx))
+            .expect("initial thread should be installed");
+        assert!(
+            initial_thread.read_with(cx, |thread, _cx| matches!(
+                thread.entries(),
+                [AgentThreadEntry::ToolCall(_)]
+            )),
+            "initialization tool call should precede the thread view"
+        );
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Use the latest settings", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, _cx| {
+            assert!(
+                view.thread_error.is_none(),
+                "refresh failed with {:?}",
+                view.thread_error
+            );
+        });
+        let state = connection.state.lock();
+        assert_eq!(state.new_session_settings.len(), 2);
+        assert_eq!(
+            state.prompts,
+            [(acp::SessionId::new("session-2"), "ask".to_string())]
+        );
+        assert_eq!(state.closed_sessions, [acp::SessionId::new("session-1")]);
+    }
+
+    #[gpui::test]
+    async fn test_draft_session_refresh_does_not_replace_changed_thread(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = DraftRefreshingConnection::default();
+        connection.state.lock().current_setting = "initial".to_string();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let initial_thread = conversation_view
+            .read_with(cx, |view, cx| view.root_thread(cx))
+            .expect("initial thread should be installed");
+        let (initial_session_id, project, thread_connection) =
+            initial_thread.read_with(cx, |thread, _cx| {
+                (
+                    thread.session_id().clone(),
+                    thread.project().clone(),
+                    thread.connection().clone(),
+                )
+            });
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Keep this prompt", window, cx);
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+
+        let changed_thread = cx.update(|_, cx| {
+            build_test_thread(
+                thread_connection,
+                project,
+                "ChangedDraftConnection",
+                initial_session_id.clone(),
+                cx,
+            )
+        });
+        thread_view.update(cx, |view, _cx| {
+            view.thread = changed_thread.clone();
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread(cx)
+                    .expect("changed thread should remain installed")
+                    .entity_id(),
+                changed_thread.entity_id()
+            );
+        });
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(view.thread_error.is_some());
+        });
+        assert_eq!(
+            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "Keep this prompt"
+        );
+
+        let state = connection.state.lock();
+        assert_eq!(state.new_session_settings.len(), 2);
+        assert!(state.prompts.is_empty());
+        assert_eq!(state.closed_sessions, [acp::SessionId::new("session-2")]);
+    }
+
+    #[gpui::test]
+    async fn test_auto_submitted_draft_does_not_refresh_session(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = DraftRefreshingConnection::default();
+        connection.state.lock().current_setting = "initial".to_string();
+        let initial_content = AgentInitialContent::ContentBlock {
+            blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                "Submit immediately",
+            ))],
+            auto_submit: true,
+        };
+        let (_conversation_view, cx) = setup_conversation_view_with_initial_content(
+            StubAgentServer::new(connection.clone()),
+            initial_content,
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+
+        let state = connection.state.lock();
+        assert_eq!(state.new_session_settings, ["initial".to_string()]);
+        assert_eq!(
+            state.prompts,
+            [(acp::SessionId::new("session-1"), "ask".to_string())]
+        );
+        assert!(state.closed_sessions.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_failed_draft_session_refresh_preserves_prompt_for_retry(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = DraftRefreshingConnection::default();
+        {
+            let mut state = connection.state.lock();
+            state.current_setting = "initial".to_string();
+            state.fail_session_creation = Some(2);
+        }
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Keep this prompt", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        {
+            let state = connection.state.lock();
+            assert_eq!(state.new_session_settings.len(), 2);
+            assert!(state.prompts.is_empty());
+        }
+        assert_eq!(
+            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "Keep this prompt"
+        );
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread(cx)
+                    .expect("original draft should remain installed")
+                    .read(cx)
+                    .session_id(),
+                &acp::SessionId::new("session-1")
+            );
+        });
+
+        connection.state.lock().fail_session_creation = None;
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        let state = connection.state.lock();
+        assert_eq!(state.new_session_settings.len(), 3);
+        assert_eq!(
+            state.prompts,
+            [(acp::SessionId::new("session-3"), "ask".to_string())]
+        );
+        assert_eq!(state.closed_sessions, [acp::SessionId::new("session-1")]);
     }
 
     struct FailingAgentServer;
