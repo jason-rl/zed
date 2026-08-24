@@ -621,6 +621,7 @@ pub struct ThreadView {
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp::ToolCallId>,
     pub is_loading_contents: bool,
+    refresh_session_before_first_prompt: bool,
     pub new_server_version_available: Option<SharedString>,
     pub resumed_without_history: bool,
     pub(crate) permission_selections: HashMap<acp::ToolCallId, PermissionSelection>,
@@ -841,6 +842,7 @@ impl ThreadView {
         code_span_resolver: AgentCodeSpanResolver,
         thread_store: Option<Entity<ThreadStore>>,
         initial_content: Option<AgentInitialContent>,
+        allow_draft_session_refresh: bool,
         mut subscriptions: Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -903,6 +905,19 @@ impl ThreadView {
         let show_codex_windows_warning = cfg!(windows)
             && project.upgrade().is_some_and(|p| p.read(cx).is_local())
             && agent_id.as_ref() == "Codex";
+
+        let refresh_session_before_first_prompt = allow_draft_session_refresh
+            && !should_auto_submit
+            && parent_session_id.is_none()
+            && !thread
+                .read(cx)
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            && thread
+                .read(cx)
+                .connection()
+                .refresh_session_before_first_prompt();
 
         if let Some(project) = project.upgrade() {
             subscriptions.push(cx.subscribe(&project, {
@@ -1070,6 +1085,7 @@ impl ThreadView {
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
+            refresh_session_before_first_prompt,
             new_server_version_available: None,
             permission_selections: HashMap::default(),
             elicitation_form_states: HashMap::default(),
@@ -1635,6 +1651,57 @@ impl ThreadView {
                 cx.notify();
                 return;
             }
+        }
+
+        if self.refresh_session_before_first_prompt {
+            self.refresh_session_before_first_prompt = false;
+            self.is_loading_contents = true;
+            self.thread_error.take();
+            self.thread_feedback.clear();
+            self.editing_message.take();
+
+            let expected_thread = self.thread.clone();
+            let thread = expected_thread.read(cx);
+            let expected_session_id = thread.session_id().clone();
+            let connection = thread.connection().clone();
+            let work_dirs = thread
+                .work_dirs()
+                .cloned()
+                .unwrap_or_else(|| thread.project().read(cx).default_path_list(cx));
+            let session_options = PersistedAcpSessionOptions::capture(
+                connection.session_modes(&expected_session_id, cx),
+                connection.session_config_options(&expected_session_id, cx),
+            );
+            let draft_contents = message_editor.update(cx, |editor, cx| editor.draft_contents(cx));
+            let refresh_task = self
+                .server_view
+                .update(cx, |server_view, cx| {
+                    server_view.refresh_draft_session_before_first_prompt(
+                        expected_thread,
+                        connection,
+                        work_dirs,
+                        session_options,
+                        draft_contents,
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap_or_else(|error| Task::ready(Err(error)));
+
+            cx.spawn(async move |this, cx| {
+                let result = refresh_task.await;
+                this.update(cx, |this, cx| {
+                    this.is_loading_contents = false;
+                    if let Err(error) = result {
+                        this.refresh_session_before_first_prompt = true;
+                        this.handle_thread_error(error, cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
         }
 
         // A built-in command (e.g. `/compact`): run the bare command without
