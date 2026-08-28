@@ -1,5 +1,6 @@
 use super::*;
 use crate::Buffer;
+use crate::language_settings::LanguageSettings;
 use clock::ReplicaId;
 use collections::BTreeMap;
 use futures::FutureExt as _;
@@ -16,6 +17,7 @@ use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
 use std::collections::BTreeSet;
 use std::{
     env,
+    num::NonZeroU32,
     ops::Range,
     sync::LazyLock,
     time::{Duration, Instant},
@@ -36,6 +38,47 @@ pub static TRAILING_WHITESPACE_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| 
         .build()
         .expect("Failed to create TRAILING_WHITESPACE_REGEX")
 });
+
+#[gpui::test]
+fn test_detect_indentation_from_initial_buffer_contents(cx: &mut App) {
+    init_settings(cx, |settings| {
+        settings.defaults.detect_indentation = Some(true);
+        settings.defaults.tab_size = NonZeroU32::new(7);
+        settings.defaults.hard_tabs = Some(true);
+    });
+
+    cx.new(|cx| {
+        let mut buffer = Buffer::local("root\n  child\n    grandchild\n  child\nroot\n", cx);
+        let settings = LanguageSettings::for_buffer(&buffer, cx);
+        assert_eq!(settings.tab_size, NonZeroU32::new(2).unwrap());
+        assert!(!settings.hard_tabs);
+        drop(settings);
+
+        buffer.set_modeline(Some(ModelineSettings {
+            tab_size: NonZeroU32::new(3),
+            hard_tabs: Some(true),
+            ..Default::default()
+        }));
+        let settings = LanguageSettings::for_buffer(&buffer, cx);
+        assert_eq!(settings.tab_size, NonZeroU32::new(3).unwrap());
+        assert!(settings.hard_tabs);
+
+        buffer
+    });
+
+    cx.new(|cx| {
+        let mut buffer = Buffer::local("", cx);
+        buffer.edit(
+            [(0..0, "root\n  child\n    grandchild\n  child\nroot\n")],
+            None,
+            cx,
+        );
+        let settings = LanguageSettings::for_buffer(&buffer, cx);
+        assert_eq!(settings.tab_size, NonZeroU32::new(7).unwrap());
+        assert!(settings.hard_tabs);
+        buffer
+    });
+}
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

@@ -2,6 +2,7 @@
 
 use crate::{
     Buffer, BufferSnapshot, File, Language, LanguageName, LanguageServerName, ModelineSettings,
+    indentation::IndentationAnalysis,
 };
 use collections::{FxHashMap, HashMap, HashSet};
 use ec4rs::{
@@ -60,6 +61,8 @@ pub struct WhitespaceMap {
 pub struct LanguageSettings {
     /// How many columns a tab should occupy.
     pub tab_size: NonZeroU32,
+    /// Whether to infer indentation style and size from existing file contents.
+    pub detect_indentation: bool,
     /// Whether to indent lines using tab characters, as opposed to multiple
     /// spaces.
     pub hard_tabs: bool,
@@ -312,6 +315,12 @@ impl LanguageSettings {
             cx,
         );
 
+        merge_with_detected_indentation(
+            settings.to_mut(),
+            buffer.indentation_analysis(),
+            editorconfig_properties(location, cx).as_ref(),
+        );
+
         if let Some(modeline) = buffer.modeline() {
             merge_with_modeline(settings.to_mut(), modeline);
         }
@@ -337,6 +346,12 @@ impl LanguageSettings {
         } else {
             all.language(location, override_language, cx)
         };
+
+        merge_with_detected_indentation(
+            settings.to_mut(),
+            buffer.indentation_analysis(),
+            editorconfig_properties(location, cx).as_ref(),
+        );
 
         if let Some(modeline) = buffer.modeline() {
             merge_with_modeline(settings.to_mut(), modeline);
@@ -595,12 +610,7 @@ impl AllLanguageSettings {
             .and_then(|name| self.languages.get(name))
             .unwrap_or(&self.defaults);
 
-        let editorconfig_properties = location.and_then(|location| {
-            cx.global::<SettingsStore>()
-                .editorconfig_store
-                .read(cx)
-                .properties(location.worktree_id, location.path)
-        });
+        let editorconfig_properties = editorconfig_properties(location, cx);
         if let Some(editorconfig_properties) = editorconfig_properties {
             let mut settings = settings.clone();
             merge_with_editorconfig(&mut settings, &editorconfig_properties);
@@ -624,6 +634,57 @@ impl AllLanguageSettings {
     /// Returns the edit predictions preview mode for the given language and path.
     pub fn edit_predictions_mode(&self) -> EditPredictionsMode {
         self.edit_predictions.mode
+    }
+}
+
+fn editorconfig_properties(
+    location: Option<SettingsLocation<'_>>,
+    cx: &App,
+) -> Option<EditorconfigProperties> {
+    location.and_then(|location| {
+        cx.global::<SettingsStore>()
+            .editorconfig_store
+            .read(cx)
+            .properties(location.worktree_id, location.path)
+    })
+}
+
+fn merge_with_detected_indentation(
+    settings: &mut LanguageSettings,
+    analysis: &IndentationAnalysis,
+    editorconfig: Option<&EditorconfigProperties>,
+) {
+    if !settings.detect_indentation {
+        return;
+    }
+
+    let Some(indentation) =
+        analysis.inferred_indentation(settings.tab_size, settings.preferred_line_length)
+    else {
+        return;
+    };
+
+    let has_explicit_style = editorconfig.is_some_and(|properties| {
+        properties
+            .get_raw::<IndentStyle>()
+            .filter_unset()
+            .into_option()
+            .is_some()
+    });
+    if !has_explicit_style {
+        settings.hard_tabs = indentation.hard_tabs;
+    }
+
+    let has_explicit_size = editorconfig.is_some_and(|properties| {
+        properties
+            .get_raw::<TabWidth>()
+            .filter_unset()
+            .into_option()
+            .is_some()
+            || matches!(properties.get::<IndentSize>(), Ok(IndentSize::Value(_)))
+    });
+    if !has_explicit_size && let Some(tab_size) = indentation.tab_size {
+        settings.tab_size = tab_size;
     }
 }
 
@@ -730,6 +791,7 @@ impl settings::Settings for AllLanguageSettings {
 
             LanguageSettings {
                 tab_size: settings.tab_size.unwrap(),
+                detect_indentation: settings.detect_indentation.unwrap(),
                 hard_tabs: settings.hard_tabs.unwrap(),
                 soft_wrap: settings.soft_wrap.unwrap(),
                 preferred_line_length: settings.preferred_line_length.unwrap(),

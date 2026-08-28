@@ -461,6 +461,11 @@ pub struct LanguageSettingsContent {
     /// Default: 4
     #[schemars(range(min = 1, max = 128))]
     pub tab_size: Option<NonZeroU32>,
+    /// Whether to infer indentation style and size from existing file contents.
+    /// Explicit EditorConfig and modeline settings take precedence.
+    ///
+    /// Default: false
+    pub detect_indentation: Option<bool>,
     /// Whether to indent lines using tab characters, as opposed to multiple
     /// spaces.
     ///
