@@ -39,6 +39,7 @@ The following VS Code settings are automatically imported when you use **Import 
 | `editor.fontSize`                           | `buffer_font_size`                             |
 | `editor.fontWeight`                         | `buffer_font_weight`                           |
 | `editor.tabSize`                            | `tab_size`                                     |
+| `editor.detectIndentation`                  | `detect_indentation`                           |
 | `editor.insertSpaces`                       | `hard_tabs` (inverted)                         |
 | `editor.wordWrap`                           | `soft_wrap`                                    |
 | `editor.wordWrapColumn`                     | `preferred_line_length`                        |
@@ -178,6 +179,7 @@ Here’s how common VS Code settings translate:
 | editor.fontFamily | buffer_font_family | Zed uses Zed Mono by default |
 | editor.fontSize | buffer_font_size | Set in pixels |
 | editor.tabSize | tab_size | Can override per language |
+| editor.detectIndentation | detect_indentation | Detects indentation when opening files |
 | editor.insertSpaces | insert_spaces | Boolean |
 | editor.formatOnSave | format_on_save | Works with formatter enabled |
 | editor.wordWrap | soft_wrap | Supports optional wrap column |
