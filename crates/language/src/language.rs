@@ -11,6 +11,7 @@ mod buffer;
 mod diagnostic;
 mod diagnostic_set;
 mod file_content;
+mod indentation;
 mod language_registry;
 
 pub mod language_settings;

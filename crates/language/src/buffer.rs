@@ -7,6 +7,7 @@ use crate::{
     ByteContent, DebuggerTextObject, LanguageScope, ModelineSettings, Outline, OutlineConfig,
     PLAIN_TEXT, RunnableTag, TextObject, TreeSitterOptions, analyze_byte_content,
     diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup},
+    indentation::IndentationAnalysis,
     language_settings::{AutoIndentMode, LanguageSettings},
     outline::OutlineItem,
     row_chunk::RowChunks,
@@ -136,6 +137,7 @@ pub struct Buffer {
     has_unsaved_edits: Cell<(clock::Global, bool)>,
     change_bits: Vec<rc::Weak<Cell<bool>>>,
     modeline: Option<Arc<ModelineSettings>>,
+    indentation_analysis: Arc<IndentationAnalysis>,
     _subscriptions: Vec<gpui::Subscription>,
     resolved_settings: Option<Arc<LanguageSettings>>,
     _settings_observer: Option<gpui::Subscription>,
@@ -196,6 +198,7 @@ pub struct BufferSnapshot {
     pub capability: Capability,
     modeline: Option<Arc<ModelineSettings>>,
     resolved_settings: Option<Arc<LanguageSettings>>,
+    indentation_analysis: Arc<IndentationAnalysis>,
 }
 
 /// The kind and amount of indentation in a particular line. For now,
@@ -1128,6 +1131,7 @@ impl Buffer {
     ) -> Self {
         let saved_mtime = file.as_ref().and_then(|file| file.disk_state().mtime());
         let snapshot = buffer.snapshot();
+        let indentation_analysis = Arc::new(IndentationAnalysis::new(snapshot.as_rope()));
         let syntax_map = Mutex::new(SyntaxMap::new(&snapshot));
         let tree_sitter_data = TreeSitterData::new(snapshot);
         let mut this = Self {
@@ -1166,6 +1170,7 @@ impl Buffer {
             has_conflict: false,
             change_bits: Default::default(),
             modeline: None,
+            indentation_analysis,
             _subscriptions: Vec::new(),
             resolved_settings: None,
             _settings_observer: Some(cx.observe_global::<SettingsStore>(|this, cx| {
@@ -1213,6 +1218,7 @@ impl Buffer {
             let text =
                 TextBuffer::new_normalized(ReplicaId::LOCAL, buffer_id, Default::default(), text);
             let text = text.into_snapshot();
+            let indentation_analysis = Arc::new(IndentationAnalysis::new(text.as_rope()));
             let mut syntax = SyntaxMap::new(&text).snapshot();
             if let Some(language) = language.clone() {
                 let language_registry = language_registry.clone();
@@ -1231,6 +1237,7 @@ impl Buffer {
                 capability: Capability::ReadOnly,
                 modeline,
                 resolved_settings: None,
+                indentation_analysis,
             }
         }
     }
@@ -1245,6 +1252,7 @@ impl Buffer {
             Rope::new(),
         );
         let text = text.into_snapshot();
+        let indentation_analysis = Arc::new(IndentationAnalysis::new(text.as_rope()));
         let syntax = SyntaxMap::new(&text).snapshot();
         let tree_sitter_data = TreeSitterData::new(&text);
         BufferSnapshot {
@@ -1259,6 +1267,7 @@ impl Buffer {
             capability: Capability::ReadOnly,
             modeline: None,
             resolved_settings: None,
+            indentation_analysis,
         }
     }
 
@@ -1274,6 +1283,7 @@ impl Buffer {
         let text =
             TextBuffer::new_normalized(ReplicaId::LOCAL, buffer_id, Default::default(), text)
                 .into_snapshot();
+        let indentation_analysis = Arc::new(IndentationAnalysis::new(text.as_rope()));
         let mut syntax = SyntaxMap::new(&text).snapshot();
         if let Some(language) = language.clone() {
             syntax.reparse(&text, language_registry, language);
@@ -1291,6 +1301,7 @@ impl Buffer {
             capability: Capability::ReadOnly,
             modeline: None,
             resolved_settings: None,
+            indentation_analysis,
         }
     }
 
@@ -1323,6 +1334,7 @@ impl Buffer {
             capability: self.capability,
             modeline: self.modeline.clone(),
             resolved_settings: self.resolved_settings.clone(),
+            indentation_analysis: self.indentation_analysis.clone(),
         }
     }
 
@@ -1338,6 +1350,7 @@ impl Buffer {
                 has_conflict: self.has_conflict,
                 has_unsaved_edits: Cell::new(self.has_unsaved_edits.get_mut().clone()),
                 _subscriptions: vec![cx.subscribe(&this, Self::on_base_buffer_event)],
+                indentation_analysis: self.indentation_analysis.clone(),
                 ..Self::build(self.text.branch(), self.file.clone(), self.capability(), cx)
             };
             if let Some(language_registry) = self.language_registry() {
@@ -1596,6 +1609,10 @@ impl Buffer {
         self.modeline.as_ref()
     }
 
+    pub(crate) fn indentation_analysis(&self) -> &IndentationAnalysis {
+        &self.indentation_analysis
+    }
+
     /// Assign the buffer a new [`Capability`].
     pub fn set_capability(&mut self, capability: Capability, cx: &mut Context<Self>) {
         if self.capability != capability {
@@ -1740,6 +1757,7 @@ impl Buffer {
         self.has_unsaved_edits
             .set((self.saved_version.clone(), false));
         self.text.set_line_ending(line_ending);
+        self.indentation_analysis = Arc::new(IndentationAnalysis::new(self.text.as_rope()));
         self.saved_mtime = mtime;
         cx.emit(BufferEvent::Reloaded);
         cx.notify();
@@ -4142,6 +4160,10 @@ impl BufferSnapshot {
         self.resolved_settings.as_ref()
     }
 
+    pub(crate) fn indentation_analysis(&self) -> &IndentationAnalysis {
+        &self.indentation_analysis
+    }
+
     /// Returns the main [`Language`].
     pub fn language(&self) -> Option<&Arc<Language>> {
         self.language.as_ref()
@@ -5377,6 +5399,7 @@ impl Clone for BufferSnapshot {
             capability: self.capability,
             modeline: self.modeline.clone(),
             resolved_settings: self.resolved_settings.clone(),
+            indentation_analysis: self.indentation_analysis.clone(),
         }
     }
 }
