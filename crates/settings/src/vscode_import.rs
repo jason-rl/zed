@@ -593,7 +593,7 @@ impl VsCodeSettings {
                 }
             }),
             formatter: None,
-            detect_indentation: None,
+            detect_indentation: self.read_bool("editor.detectIndentation"),
             hard_tabs: self.read_bool("editor.insertSpaces").map(|v| !v),
             indent_guides: skip_default(IndentGuideSettingsContent {
                 enabled: self.read_bool("editor.guides.indentation"),
@@ -1324,6 +1324,21 @@ mod tests {
         assert_eq!(
             imported_title(r#"{ "window.title": "${activeFolderShort} — literal" }"#),
             Some(" — literal".to_string())
+        );
+    }
+
+    #[test]
+    fn test_import_detect_indentation() {
+        let imported = VsCodeSettings::from_str(
+            r#"{ "editor.detectIndentation": true }"#,
+            VsCodeSettingsSource::VsCode,
+        )
+        .unwrap()
+        .settings_content();
+
+        assert_eq!(
+            imported.project.all_languages.defaults.detect_indentation,
+            Some(true)
         );
     }
 }
