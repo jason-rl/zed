@@ -637,6 +637,16 @@ Disabling this setting does not erase history.
 
 `boolean` values
 
+## Detect Indentation
+
+- Description: Whether to infer indentation style and size from existing file contents. Detection runs when a file is opened or reloaded. If the result is ambiguous or the file is empty, Zed uses `hard_tabs` and `tab_size` instead. Explicit EditorConfig and modeline settings take precedence.
+- Setting: `detect_indentation`
+- Default: `false`
+
+**Options**
+
+`boolean` values
+
 ## Diagnostics Max Severity
 
 - Description: Which level to use to filter out diagnostics displayed in the editor
@@ -3317,6 +3327,7 @@ The following settings can be overridden for each specific language:
 - [`line_ending`](#line-ending)
 - [`format_on_save`](#format-on-save)
 - [`formatter`](#formatter)
+- [`detect_indentation`](#detect-indentation)
 - [`hard_tabs`](#hard-tabs)
 - [`preferred_line_length`](#preferred-line-length)
 - [`remove_trailing_whitespace_on_save`](#remove-trailing-whitespace-on-save)
