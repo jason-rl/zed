@@ -264,6 +264,7 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
             "settings.json": r#"{
                 "tab_size": 8,
                 "hard_tabs": false,
+                "detect_indentation": true,
                 "ensure_final_newline_on_save": false,
                 "remove_trailing_whitespace_on_save": false,
                 "preferred_line_length": 64,
@@ -281,7 +282,7 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
                 },
             }"#,
         },
-        "a.rs": "fn a() {\n    A\n}",
+        "a.rs": "fn a() {\n    A\n    B\n}",
         "b": {
             ".editorconfig": r#"
             [*.rs]
@@ -309,6 +310,7 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
         },
         "README.json": "tabs are better\n",
         "README.md": "spaces are meaningful  \n",
+        "plain.txt": "root\n  first\n  second\n",
     }));
 
     let path = dir.path();
@@ -343,6 +345,7 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
     let settings_e = settings_for("e/e.rs", cx).await;
     let settings_readme = settings_for("README.json", cx).await;
     let settings_markdown = settings_for("README.md", cx).await;
+    let settings_plain = settings_for("plain.txt", cx).await;
     // .editorconfig overrides .zed/settings
     assert_eq!(Some(settings_a.tab_size), NonZeroU32::new(3));
     assert_eq!(settings_a.hard_tabs, true);
@@ -371,6 +374,8 @@ async fn test_editorconfig_support(cx: &mut gpui::TestAppContext) {
     assert_eq!(settings_c.remove_trailing_whitespace_on_save, false);
     assert_eq!(settings_readme.remove_trailing_whitespace_on_save, true);
     assert_eq!(settings_markdown.remove_trailing_whitespace_on_save, true);
+    assert_eq!(Some(settings_plain.tab_size), NonZeroU32::new(2));
+    assert_eq!(settings_plain.hard_tabs, false);
 
     // When max_line_length is "off", default to .zed/settings.json
     assert_eq!(settings_b.preferred_line_length, 64);
