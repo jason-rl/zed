@@ -448,7 +448,7 @@ fn build_injected_css(theme: &MermaidTheme, svg_id: &str) -> String {
         .node .row-rect-even path {{ fill: {er_even} !important; }}
         .edge-thickness-normal {{ stroke-width: 1px; }}
         .relation {{ stroke: {line}; stroke-width: 1; fill: none; }}
-        .edgePaths path {{ fill: none; }}
+        .edgePaths path {{ fill: none !important; }}
         .marker {{ fill: {line} !important; stroke: {line} !important; }}
         .marker.er {{ fill: none !important; stroke: {line} !important; }}
         .composition {{ fill: {line} !important; stroke: {line} !important; stroke-width: 1; }}

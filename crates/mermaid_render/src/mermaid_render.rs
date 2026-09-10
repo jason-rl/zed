@@ -174,17 +174,92 @@ pub(crate) fn css_color(color: Hsla) -> String {
 
 pub use postprocess::util::text_color_for_background;
 
+// Characters such as apostrophes in an unquoted font name can invalidate the
+// remaining SVG stylesheet, including unrelated edge styles.
+fn css_font_family_list(font_family_list: &str) -> String {
+    let mut result = Vec::new();
+    for font_family in font_family_list
+        .split(',')
+        .map(str::trim)
+        .filter(|font_family| !font_family.is_empty())
+    {
+        let font_family = font_family
+            .strip_prefix('"')
+            .and_then(|font_family| font_family.strip_suffix('"'))
+            .or_else(|| {
+                font_family
+                    .strip_prefix('\'')
+                    .and_then(|font_family| font_family.strip_suffix('\''))
+            })
+            .unwrap_or(font_family);
+        if matches!(
+            font_family.to_ascii_lowercase().as_str(),
+            "serif"
+                | "sans-serif"
+                | "monospace"
+                | "cursive"
+                | "fantasy"
+                | "system-ui"
+                | "ui-serif"
+                | "ui-sans-serif"
+                | "ui-monospace"
+                | "ui-rounded"
+                | "math"
+                | "emoji"
+                | "fangsong"
+                | "-apple-system"
+        ) {
+            result.push(font_family.to_string());
+        } else {
+            let mut quoted_font_family = String::with_capacity(font_family.len() + 2);
+            quoted_font_family.push('"');
+            for character in font_family.chars() {
+                match character {
+                    '\\' | '"' => {
+                        quoted_font_family.push('\\');
+                        quoted_font_family.push(character);
+                    }
+                    '\n' | '\r' | '\u{c}' => quoted_font_family.push(' '),
+                    '\0' => quoted_font_family.push('\u{fffd}'),
+                    _ => quoted_font_family.push(character),
+                }
+            }
+            quoted_font_family.push('"');
+            result.push(quoted_font_family);
+        }
+    }
+
+    if result.is_empty() {
+        result.push("sans-serif".to_string());
+    }
+    result.join(", ")
+}
+
 /// See the [module-level docs][crate] for more info.
 #[ztracing::instrument(skip_all)]
 pub fn render_to_svg(source: &str, theme: &MermaidTheme) -> Result<String> {
-    let svg = render::render_mermaid(source, theme)?;
-    let svg = postprocess::postprocess(&svg, theme)?;
+    let mut theme = theme.clone();
+    theme.font_family = css_font_family_list(&theme.font_family);
+    let svg = render::render_mermaid(source, &theme)?;
+    let svg = postprocess::postprocess(&svg, &theme)?;
     Ok(svg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_family_lists_are_valid_css() {
+        assert_eq!(
+            css_font_family_list("LJ's Iosevka Etoile, sans-serif"),
+            r#""LJ's Iosevka Etoile", sans-serif"#
+        );
+        assert_eq!(
+            css_font_family_list(r#""Segoe UI", system-ui"#),
+            r#""Segoe UI", system-ui"#
+        );
+    }
 
     #[test]
     fn mermaid_diagram_with_mixed_weight_combining_marks_does_not_panic() {

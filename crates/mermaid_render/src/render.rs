@@ -184,6 +184,30 @@ mod tests {
     }
 
     #[test]
+    fn flowchart_with_apostrophe_in_font_family_renders_edges_and_text() {
+        let source = r#"flowchart LR
+            blueprint["Blueprint Operator"] -->|"identity, authorized bases,<br/>destination, output mode"| driver["Trusted build driver"]
+            driver -->|"terminal outcome and logs"| blueprint"#;
+        let mut theme = MermaidTheme::default();
+        theme.font_family = "LJ's Iosevka Etoile, sans-serif".to_string();
+        let svg = crate::render_to_svg(source, &theme).expect("render failed");
+        let mut options = usvg::Options::default();
+        options.fontdb_mut().load_system_fonts();
+        let tree = usvg::Tree::from_str(&svg, &options).expect("SVG parsing failed");
+
+        for expected_id_suffix in ["-L_blueprint_driver_0", "-L_driver_blueprint_0"] {
+            let edge = path_with_id_suffix(tree.root(), expected_id_suffix)
+                .unwrap_or_else(|| panic!("edge path {expected_id_suffix} missing"));
+            assert!(edge.fill().is_none(), "edge path unexpectedly has a fill");
+            assert!(edge.stroke().is_some(), "edge path is missing its stroke");
+        }
+        assert_eq!(
+            text_font_family(tree.root(), "Blueprint Operator"),
+            Some(usvg::FontFamily::Named("LJ's Iosevka Etoile".to_string()))
+        );
+    }
+
+    #[test]
     fn class_diagram_labels_keep_sixteen_pixel_font_size() {
         let source = r#"classDiagram
             class User {
@@ -253,6 +277,52 @@ mod tests {
                     }
                 }
                 usvg::Node::Path(_) | usvg::Node::Image(_) => {}
+            }
+        }
+
+        None
+    }
+
+    fn text_font_family(group: &usvg::Group, expected_text: &str) -> Option<usvg::FontFamily> {
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(group) => {
+                    if let Some(font_family) = text_font_family(group, expected_text) {
+                        return Some(font_family);
+                    }
+                }
+                usvg::Node::Text(text) => {
+                    for chunk in text.chunks() {
+                        if chunk.text() == expected_text {
+                            return chunk
+                                .spans()
+                                .first()
+                                .and_then(|span| span.font().families().first().cloned());
+                        }
+                    }
+                }
+                usvg::Node::Path(_) | usvg::Node::Image(_) => {}
+            }
+        }
+
+        None
+    }
+
+    fn path_with_id_suffix<'a>(
+        group: &'a usvg::Group,
+        expected_id_suffix: &str,
+    ) -> Option<&'a usvg::Path> {
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(group) => {
+                    if let Some(path) = path_with_id_suffix(group, expected_id_suffix) {
+                        return Some(path);
+                    }
+                }
+                usvg::Node::Path(path) if path.id().ends_with(expected_id_suffix) => {
+                    return Some(path);
+                }
+                usvg::Node::Path(_) | usvg::Node::Image(_) | usvg::Node::Text(_) => {}
             }
         }
 
