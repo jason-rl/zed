@@ -35,27 +35,6 @@ struct ElementFixup<I> {
     skip_rect_depth: usize,
 }
 
-fn rewrite_attr<'a>(
-    e: &BytesStart<'_>,
-    attr_name: &[u8],
-    new_value: &str,
-) -> Result<BytesStart<'a>> {
-    let name = e.name();
-    let tag = std::str::from_utf8(name.as_ref())?;
-    let mut new_elem = BytesStart::new(tag.to_owned());
-    for attr in e.attributes() {
-        let attr = attr?;
-        if attr.key.local_name().as_ref() == attr_name {
-            let local_name = attr.key.local_name();
-            let key = std::str::from_utf8(local_name.as_ref())?;
-            new_elem.push_attribute((key, new_value));
-        } else {
-            new_elem.push_attribute(attr);
-        }
-    }
-    Ok(new_elem)
-}
-
 fn rewrap<'a>(event: &Event<'_>, elem: BytesStart<'a>) -> Event<'a> {
     match event {
         Event::Start(_) => Event::Start(elem),
@@ -180,20 +159,33 @@ fn rewrite_font_style<'a>(style: &'a str, font_family: &str) -> Cow<'a, str> {
 }
 
 impl<'a, I: Iterator<Item = Result<Event<'a>>>> ElementFixup<I> {
-    fn rewrite_svg_style(&self, e: &BytesStart<'_>) -> Result<Option<BytesStart<'a>>> {
-        let Some(style) = e
-            .try_get_attribute("style")?
-            .map(|a| a.unescape_value())
-            .transpose()?
-        else {
-            return Ok(None);
-        };
-        let new_style = rewrite_background_style(&style, &self.background_css);
-        if matches!(new_style, Cow::Borrowed(_)) {
-            return Ok(None);
+    fn rewrite_svg_element(&self, e: &BytesStart<'_>) -> Result<BytesStart<'a>> {
+        let name = e.name();
+        let tag = std::str::from_utf8(name.as_ref())?;
+        let mut new_elem = BytesStart::new(tag.to_owned());
+        let mut has_font_family = false;
+
+        for attr in e.attributes() {
+            let attr = attr?;
+            match attr.key.local_name().as_ref() {
+                b"style" => {
+                    let style = attr.unescape_value()?;
+                    let style = rewrite_background_style(&style, &self.background_css);
+                    new_elem.push_attribute(("style", style.as_ref()));
+                }
+                b"font-family" => {
+                    has_font_family = true;
+                    new_elem.push_attribute(("font-family", self.font_family_css.as_str()));
+                }
+                _ => new_elem.push_attribute(attr),
+            }
         }
 
-        Ok(Some(rewrite_attr(e, b"style", &new_style)?))
+        if !has_font_family {
+            new_elem.push_attribute(("font-family", self.font_family_css.as_str()));
+        }
+
+        Ok(new_elem)
     }
 
     fn rewrite_text_element(&self, e: &BytesStart<'_>, fix_fill: bool) -> Result<BytesStart<'a>> {
@@ -243,11 +235,7 @@ impl<'a, I: Iterator<Item = Result<Event<'a>>>> ElementFixup<I> {
         match &event {
             Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"svg" && !self.svg_seen => {
                 self.svg_seen = true;
-                if let Some(new_elem) = self.rewrite_svg_style(e)? {
-                    Ok(Some(rewrap(&event, new_elem)))
-                } else {
-                    Ok(Some(event))
-                }
+                Ok(Some(rewrap(&event, self.rewrite_svg_element(e)?)))
             }
 
             Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"rect" => {
@@ -313,5 +301,37 @@ pub(super) fn process<'a>(
         font_family_css: theme.font_family.clone(),
         svg_seen: false,
         skip_rect_depth: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svg_root_uses_theme_font_family() {
+        let fixup = ElementFixup {
+            inner: std::iter::empty::<Result<Event<'_>>>(),
+            background_css: "#ffffff".to_string(),
+            text_color_css: "#000000".to_string(),
+            font_family_css: "IBM Plex Sans, sans-serif".to_string(),
+            svg_seen: false,
+            skip_rect_depth: 0,
+        };
+        let mut element = BytesStart::new("svg");
+        element.push_attribute(("style", "background-color: white"));
+        element.push_attribute(("font-family", "Times New Roman"));
+
+        let rewritten = fixup
+            .rewrite_svg_element(&element)
+            .expect("SVG root rewrite failed");
+        let font_family = rewritten
+            .try_get_attribute("font-family")
+            .expect("invalid attributes")
+            .expect("missing font-family")
+            .unescape_value()
+            .expect("invalid font-family");
+
+        assert_eq!(font_family, "IBM Plex Sans, sans-serif");
     }
 }
