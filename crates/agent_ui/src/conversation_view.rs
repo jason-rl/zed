@@ -1835,7 +1835,20 @@ impl ConversationView {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
-                self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
+                let sent_queued_message = !is_subagent
+                    && self.thread_view(&session_id).is_some_and(|active| {
+                        active.update(cx, |active, cx| {
+                            active.dispatch_next_queued_message_for_mode_switch(window, cx)
+                        })
+                    });
+                if !sent_queued_message {
+                    self.notify_with_sound(
+                        "Waiting for tool confirmation",
+                        IconName::Info,
+                        window,
+                        cx,
+                    );
+                }
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
             AcpThreadEvent::ElicitationRequested(_) => {
@@ -4353,6 +4366,148 @@ pub(crate) mod tests {
             0,
             "No notification should fire when a queued message will be auto-sent on Stopped"
         );
+    }
+
+    #[gpui::test]
+    async fn test_queued_message_is_sent_while_waiting_for_mode_switch(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let tool_call_id = acp::ToolCallId::new("plan-review");
+        let tool_call = acp::ToolCall::new(tool_call_id.clone(), "Implement this plan?")
+            .kind(acp::ToolKind::SwitchMode);
+        let connection =
+            StubAgentConnection::new().with_permission_requests(HashMap::from_iter([(
+                tool_call_id,
+                PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                    "implement",
+                    "Implement",
+                    acp::PermissionOptionKind::AllowOnce,
+                )]),
+            )]));
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(tool_call)]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Create a plan", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.thread.read(cx).is_waiting_for_mode_switch());
+        });
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Revise the plan".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert_eq!(
+                view.message_queue.len(),
+                0,
+                "the queue head should be sent instead of waiting for plan approval"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_mode_switch_sends_message_that_was_already_queued(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Create a plan", window, cx);
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Revise the plan".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+        let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
+        let _authorization_task = request_test_tool_authorization_with_kind(
+            &thread,
+            "plan-review",
+            "implement",
+            acp::ToolKind::SwitchMode,
+            cx,
+        );
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert_eq!(
+                view.message_queue.len(),
+                0,
+                "a pending mode switch should send the existing queue head"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_other_tool_authorization_leaves_queued_message_waiting(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Make an edit", window, cx);
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Follow up".to_string(),
+                ))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+        let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
+        let _authorization_task = request_test_tool_authorization(&thread, "edit", "allow", cx);
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert_eq!(
+                view.message_queue.len(),
+                1,
+                "ordinary tool permissions should not consume queued messages"
+            );
+        });
     }
 
     #[gpui::test]
@@ -10692,6 +10847,22 @@ pub(crate) mod tests {
         option_id: &str,
         cx: &mut TestAppContext,
     ) -> Task<acp_thread::RequestPermissionOutcome> {
+        request_test_tool_authorization_with_kind(
+            thread,
+            tool_call_id,
+            option_id,
+            acp::ToolKind::Edit,
+            cx,
+        )
+    }
+
+    fn request_test_tool_authorization_with_kind(
+        thread: &Entity<AcpThread>,
+        tool_call_id: &str,
+        option_id: &str,
+        tool_kind: acp::ToolKind,
+        cx: &mut TestAppContext,
+    ) -> Task<acp_thread::RequestPermissionOutcome> {
         let tool_call_id = acp::ToolCallId::new(tool_call_id);
         let label = format!("Tool {tool_call_id}");
         let option_id = acp::PermissionOptionId::new(option_id);
@@ -10700,7 +10871,7 @@ pub(crate) mod tests {
                 thread
                     .request_tool_call_authorization(
                         acp::ToolCall::new(tool_call_id, label)
-                            .kind(acp::ToolKind::Edit)
+                            .kind(tool_kind)
                             .into(),
                         PermissionOptions::Flat(vec![acp::PermissionOption::new(
                             option_id,
