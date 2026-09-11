@@ -2583,6 +2583,25 @@ impl AcpThread {
         false
     }
 
+    pub fn is_waiting_for_mode_switch(&self) -> bool {
+        for entry in self.entries.iter().rev() {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => return false,
+                AgentThreadEntry::ToolCall(ToolCall {
+                    kind: acp::ToolKind::SwitchMode,
+                    status: ToolCallStatus::WaitingForConfirmation { .. },
+                    ..
+                }) => return true,
+                AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::Elicitation(_)
+                | AgentThreadEntry::AssistantMessage(_)
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction(_) => {}
+            }
+        }
+        false
+    }
+
     pub fn token_usage(&self) -> Option<&TokenUsage> {
         self.token_usage.as_ref()
     }
