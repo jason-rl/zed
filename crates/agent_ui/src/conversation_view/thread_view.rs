@@ -2315,8 +2315,10 @@ impl ThreadView {
             editor,
             _subscription: subscription,
         });
-        self.sync_queue_flag_to_native_thread(cx);
-        cx.notify();
+        if !self.dispatch_next_queued_message_for_mode_switch(window, cx) {
+            self.sync_queue_flag_to_native_thread(cx);
+            cx.notify();
+        }
     }
 
     fn handle_queue_editor_event(
@@ -2415,6 +2417,27 @@ impl ThreadView {
         if let Some(entry) = self.message_queue.send_now(id, is_generating) {
             self.dispatch_queued_entry(entry, window, cx);
         }
+    }
+
+    pub fn dispatch_next_queued_message_for_mode_switch(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.thread.read(cx).is_waiting_for_mode_switch() {
+            return false;
+        }
+
+        let Some(id) = self.message_queue.first_id() else {
+            return false;
+        };
+        let is_generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
+        let Some(entry) = self.message_queue.send_now(id, is_generating) else {
+            return false;
+        };
+
+        self.dispatch_queued_entry(entry, window, cx);
+        true
     }
 
     /// The shared "actually send this entry" path, used by fast-track,
