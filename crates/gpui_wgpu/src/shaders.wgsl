@@ -1315,6 +1315,10 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    opacity: f32,
+    padding0: f32,
+    padding1: f32,
+    padding2: f32,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1358,5 +1362,7 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
-    return ycbcr_to_RGB * y_cb_cr;
+    let chroma = y_cb_cr.yz - vec2<f32>(0.5);
+    let rgb = vec3<f32>(y_cb_cr.x) + vec3<f32>(1.5748 * chroma.y, -0.187324 * chroma.x - 0.468124 * chroma.y, 1.8556 * chroma.x);
+    return blend_color(vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0), surface_locals.opacity);
 }

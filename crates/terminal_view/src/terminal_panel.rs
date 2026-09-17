@@ -1404,7 +1404,7 @@ impl Focusable for FailedToSpawnTerminal {
 }
 
 impl Render for FailedToSpawnTerminal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let popover_menu = PopoverMenu::new("settings-popover")
             .trigger(
                 IconButton::new("icon-button-popover", IconName::ChevronDown)
@@ -1432,7 +1432,7 @@ impl Render for FailedToSpawnTerminal {
             .p_4()
             .items_center()
             .justify_center()
-            .bg(cx.theme().colors().editor_background)
+            .bg(cx.window_theme(window).colors().editor_background)
             .child(
                 v_flex()
                     .max_w_112()

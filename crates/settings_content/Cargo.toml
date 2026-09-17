@@ -21,6 +21,7 @@ derive_more.workspace = true
 gpui.workspace = true
 language_model_core.workspace = true
 log.workspace = true
+media_background.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

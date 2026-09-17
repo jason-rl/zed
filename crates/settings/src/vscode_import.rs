@@ -181,6 +181,7 @@ impl VsCodeSettings {
 
     pub fn settings_content(&self) -> SettingsContent {
         SettingsContent {
+            background_media: None,
             agent: self.agent_settings_content(),
             agent_servers: None,
             audio: None,

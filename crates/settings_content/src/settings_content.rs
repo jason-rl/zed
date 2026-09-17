@@ -172,6 +172,8 @@ pub enum ReduceMotionMode {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Default, Clone, Serialize, JsonSchema, MergeFrom)]
 pub struct SettingsContent {
+    /// Image, animation, or video behind workspace surfaces. This is a global setting.
+    pub background_media: Option<media_background::Settings>,
     #[serde(flatten)]
     pub project: ProjectSettingsContent,
 
@@ -409,7 +411,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation,
+        instrumentation, background_media,
     },
     defaults: {},
 });

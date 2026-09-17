@@ -159,7 +159,8 @@ impl EditorElement {
             latest_selection_anchors,
         );
 
-        let editor_bg_color = cx.theme().colors().editor_background;
+        let editor_background_color =
+            cx.media_background_color(window, cx.theme().colors().editor_background, 0.65);
 
         let selected = selected_buffer_ids.contains(&excerpt.buffer_id());
 
@@ -174,8 +175,8 @@ impl EditorElement {
                     .h(FILE_HEADER_HEIGHT as f32 * line_height)
                     .bg(linear_gradient(
                         0.,
-                        linear_color_stop(editor_bg_color.opacity(0.), 0.),
-                        linear_color_stop(editor_bg_color, 0.6),
+                        linear_color_stop(editor_background_color.opacity(0.), 0.),
+                        linear_color_stop(editor_background_color, 0.6),
                     ))
                     .absolute()
                     .top_0(),
@@ -701,6 +702,9 @@ pub(crate) fn render_buffer_header(
     let opaque_window =
         cx.theme().window_background_appearance() == WindowBackgroundAppearance::Opaque;
     let show_header_background = opaque_window || colors.editor_subheader_background.is_opaque();
+    let header_background =
+        cx.media_background_color(window, colors.editor_subheader_background, 0.65);
+    let header_hover_background = cx.media_background_color(window, colors.element_hover, 0.65);
 
     let show_open_file_button =
         can_open_excerpts && relative_path.is_some() && (is_selected || header_hovered);
@@ -738,10 +742,8 @@ pub(crate) fn render_buffer_header(
                     border.border_color(border_color)
                 })
                 .when(is_sticky && opaque_window, |s| s.shadow_md())
-                .when(show_header_background, |s| {
-                    s.bg(colors.editor_subheader_background)
-                })
-                .hover(|s| s.bg(colors.element_hover))
+                .when(show_header_background, |s| s.bg(header_background))
+                .hover(|s| s.bg(header_hover_background))
                 .map(|header| {
                     let editor = editor.clone();
                     let buffer_id = for_excerpt.buffer_id();

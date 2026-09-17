@@ -1,5 +1,20 @@
 {
   "$schema": "zed://schemas/settings",
+  // Global workspace background. Animated sources require FFmpeg and ffprobe;
+  // YouTube sources additionally require yt-dlp. See background-media.md.
+  "background_media": {
+    "source": null,
+    "opacity": 0.2,
+    "fit": "cover",
+    "max_fps": 30,
+    "max_height": null,
+    "hardware_acceleration": "auto",
+    "cache_size_mb": 10240,
+    "ffmpeg_path": "ffmpeg",
+    "ffprobe_path": "ffprobe",
+    "yt_dlp_path": "yt-dlp",
+    "youtube_cookie_fallback": null,
+  },
   // The name of the Zed theme to use for the UI.
   //
   // `mode` is one of:
