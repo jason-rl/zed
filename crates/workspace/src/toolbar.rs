@@ -107,7 +107,7 @@ impl Toolbar {
 }
 
 impl Render for Toolbar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.has_any_visible_items() {
             return div();
         }
@@ -127,7 +127,7 @@ impl Render for Toolbar {
             })
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
-            .bg(cx.theme().colors().toolbar_background)
+            .bg(cx.window_theme(window).colors().toolbar_background)
             .when(has_left_items || has_right_items, |this| {
                 this.child(
                     h_flex()

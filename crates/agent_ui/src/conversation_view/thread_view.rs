@@ -4528,7 +4528,7 @@ impl ThreadView {
         }
 
         let focus_handle = self.message_editor.focus_handle(cx);
-        let editor_bg_color = cx.theme().colors().editor_background;
+        let editor_bg_color = cx.window_theme(window).colors().editor_background;
 
         let editor_expanded = self.editor_expanded;
         let (expand_icon, expand_tooltip) = if editor_expanded {

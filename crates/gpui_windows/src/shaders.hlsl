@@ -1253,6 +1253,39 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
     return output;
 }
 
+struct SurfaceParameters {
+    Bounds bounds;
+    Bounds content_mask;
+    float opacity;
+    float3 padding;
+};
+StructuredBuffer<SurfaceParameters> video_surfaces: register(t1);
+Texture2D<float> video_y: register(t2);
+Texture2D<float2> video_uv: register(t3);
+
+struct SurfaceOutput {
+    float4 position: SV_Position;
+    float2 texture_position: TEXCOORD0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+SurfaceOutput surface_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    SurfaceParameters surface = video_surfaces[0];
+    SurfaceOutput output;
+    output.position = to_device_position(unit_vertex, surface.bounds);
+    output.texture_position = unit_vertex;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
+    return output;
+}
+
+float4 surface_fragment(SurfaceOutput input): SV_Target {
+    float luma = video_y.Sample(s_sprite, input.texture_position);
+    float2 chroma = video_uv.Sample(s_sprite, input.texture_position) - 0.5;
+    float3 rgb = luma + float3(1.5748 * chroma.y, -0.187324 * chroma.x - 0.468124 * chroma.y, 1.8556 * chroma.x);
+    return float4(saturate(rgb), video_surfaces[0].opacity);
+}
+
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
     float4 sample = t_sprite.Sample(s_sprite, input.tile_position);

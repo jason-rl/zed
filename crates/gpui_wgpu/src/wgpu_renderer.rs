@@ -13,6 +13,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use wgpu::util::DeviceExt as _;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -82,6 +83,8 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    opacity: f32,
+    _padding: [f32; 3],
 }
 
 #[repr(C)]
@@ -178,6 +181,7 @@ enum InstanceData {
 
 /// GPU resources that must be dropped together during device recovery.
 struct WgpuResources {
+    video_textures: std::collections::HashMap<u64, [wgpu::TextureView; 2]>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
@@ -562,6 +566,7 @@ impl WgpuRenderer {
         }));
 
         let resources = WgpuResources {
+            video_textures: Default::default(),
             device,
             queue,
             surface,
@@ -1419,6 +1424,7 @@ impl WgpuRenderer {
                 )
             })?;
 
+        let surface_bindings = self.prepare_surfaces(scene);
         let mut encoder =
             self.resources()
                 .device
@@ -1526,9 +1532,14 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(range) => {
+                        pass.set_pipeline(&self.resources().pipelines.surfaces);
+                        pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+                        for binding in surface_bindings[range].iter().flatten() {
+                            pass.set_bind_group(1, binding, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                    }
                 }
             }
         }
@@ -1537,6 +1548,107 @@ impl WgpuRenderer {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    fn prepare_surfaces(&mut self, scene: &Scene) -> Vec<Option<wgpu::BindGroup>> {
+        let resources = self.resources_mut();
+        resources.video_textures.retain(|id, _| {
+            scene.surfaces.iter().any(|surface| {
+            matches!(&surface.source, gpui::SurfaceSource::Nv12(frame) if frame.id == *id)
+        })
+        });
+        scene
+            .surfaces
+            .iter()
+            .map(|surface| {
+                #[allow(irrefutable_let_patterns)]
+                let gpui::SurfaceSource::Nv12(frame) = &surface.source else {
+                    return None;
+                };
+                let views = resources.video_textures.entry(frame.id).or_insert_with(|| {
+                    let split = frame.width as usize * frame.height as usize;
+                    std::array::from_fn(|plane| {
+                        let extent = wgpu::Extent3d {
+                            width: frame.width / if plane == 0 { 1 } else { 2 },
+                            height: frame.height / if plane == 0 { 1 } else { 2 },
+                            depth_or_array_layers: 1,
+                        };
+                        let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("background_video_plane"),
+                            size: extent,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: if plane == 0 {
+                                wgpu::TextureFormat::R8Unorm
+                            } else {
+                                wgpu::TextureFormat::Rg8Unorm
+                            },
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        resources.queue.write_texture(
+                            texture.as_image_copy(),
+                            if plane == 0 {
+                                &frame.data[..split]
+                            } else {
+                                &frame.data[split..]
+                            },
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(frame.width),
+                                rows_per_image: None,
+                            },
+                            extent,
+                        );
+                        texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    })
+                });
+                let parameters = SurfaceParams {
+                    bounds: surface.bounds.into(),
+                    content_mask: surface.content_mask.bounds.into(),
+                    opacity: surface.opacity,
+                    _padding: [0.0; 3],
+                };
+                let buffer =
+                    resources
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("video_surface_parameters"),
+                            contents: bytemuck::bytes_of(&parameters),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                Some(
+                    resources
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("video_surface"),
+                            layout: &resources.bind_group_layouts.surfaces,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(&views[0]),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::TextureView(&views[1]),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: wgpu::BindingResource::Sampler(
+                                        &resources.atlas_sampler,
+                                    ),
+                                },
+                            ],
+                        }),
+                )
+            })
+            .collect()
     }
 
     fn write_instances(

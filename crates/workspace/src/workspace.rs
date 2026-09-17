@@ -19,6 +19,9 @@ pub mod searchable;
 pub mod security_modal;
 pub mod shared_screen;
 pub use shared_screen::SharedScreen;
+mod background_media;
+pub use background_media::BackgroundMediaEnvironment;
+mod background_media_credentials;
 pub mod focus_follows_mouse;
 mod status_bar;
 pub mod tasks;
@@ -989,6 +992,7 @@ pub fn prompt_for_open_path_and_open(
 }
 
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
+    background_media_credentials::init(cx);
     component::init();
     theme_preview::init(cx);
     toast_layer::init(cx);
@@ -1579,6 +1583,7 @@ struct DispatchingKeystrokes {
 /// The `Workspace` owns everybody's state and serves as a default, "global context",
 /// that can be used to register a global action to be triggered from any place in the window.
 pub struct Workspace {
+    background_media: Entity<background_media::BackgroundMedia>,
     weak_self: WeakEntity<Self>,
     workspace_actions: Vec<Box<dyn Fn(Div, &Workspace, &mut Window, &mut Context<Self>) -> Div>>,
     zoomed: Option<AnyWeakView>,
@@ -2088,6 +2093,7 @@ impl Workspace {
         center.mark_positions(cx);
 
         Workspace {
+            background_media: background_media::new(weak_handle.clone(), window, cx),
             weak_self: weak_handle.clone(),
             zoomed: None,
             zoomed_position: None,
@@ -9573,7 +9579,7 @@ impl Render for Workspace {
                 div()
                     .h_full()
                     .w(relative(size))
-                    .bg(cx.theme().colors().editor_background)
+                    .bg(cx.window_theme(window).colors().editor_background)
                     .border_color(cx.theme().colors().pane_group_border)
             })
         };
@@ -9592,7 +9598,7 @@ impl Render for Workspace {
         };
         let ui_font = theme_settings::setup_ui_font(window, cx);
 
-        let theme = cx.theme().clone();
+        let theme = cx.window_theme(window).clone();
         let colors = theme.colors();
         let notification_entities = self
             .notifications
@@ -9621,6 +9627,7 @@ impl Render for Workspace {
             .items_start()
             .text_color(colors.text)
             .overflow_hidden()
+            .child(self.background_media.clone())
             // Expose the title bar as an ARIA toolbar so region navigation
             // (FocusNextPart) can reach the top bar's controls and assistive
             // technology announces it as a toolbar. The contained controls form

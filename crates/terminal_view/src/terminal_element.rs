@@ -1355,7 +1355,7 @@ impl Element for TerminalElement {
 
                 let search_matches = self.terminal.read(cx).matches.clone();
 
-                let background_color = theme.colors().terminal_background;
+                let background_color = cx.window_theme(window).colors().terminal_background;
 
                 let (hover_tooltip, hover_match) = self.terminal.update(cx, |terminal, cx| {
                     terminal.set_size(dimensions);
@@ -1675,7 +1675,12 @@ impl Element for TerminalElement {
                     });
 
                     for rect in &layout.rects {
-                        rect.paint(origin, &layout.dimensions, window);
+                        LayoutRect::new(
+                            rect.point,
+                            rect.num_of_cells,
+                            cx.media_background_color(window, rect.color, 0.35),
+                        )
+                        .paint(origin, &layout.dimensions, window);
                     }
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {

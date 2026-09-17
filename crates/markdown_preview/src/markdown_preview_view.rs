@@ -1074,17 +1074,18 @@ impl MarkdownPreviewView {
             project = Some(project_entity);
         }
 
-        let markdown_style = if let Some(theme) = preview_theme {
-            MarkdownStyle::themed_with_overrides(
-                MarkdownFont::Preview,
-                theme.colors(),
-                theme.syntax(),
-                window,
-                cx,
-            )
-        } else {
-            MarkdownStyle::themed(MarkdownFont::Preview, window, cx)
-        };
+        let theme = preview_theme.as_ref().unwrap_or_else(|| cx.theme());
+        let mut markdown_style = MarkdownStyle::themed_with_overrides(
+            MarkdownFont::Preview,
+            theme.colors(),
+            theme.syntax(),
+            window,
+            cx,
+        );
+        markdown_style.code_block.background = Some(
+            cx.media_background_color(window, theme.colors().editor_background, 0.35)
+                .into(),
+        );
 
         let mut markdown_element = MarkdownElement::new(self.markdown.clone(), markdown_style)
             .code_block_renderer(CodeBlockRenderer::Default {
@@ -1777,7 +1778,7 @@ impl Render for MarkdownPreviewView {
             .flex_1()
             .min_h_0()
             .relative()
-            .bg(bg_color)
+            .bg(cx.media_background_color(window, bg_color, 0.0))
             .child(
                 WithRemSize::new(preview_font_size).size_full().child(
                     div()
@@ -2224,6 +2225,93 @@ mod tests {
         MarkdownPreviewView, filter_non_rendered_matches, open_preview_url,
         reset_persisted_font_size,
     };
+
+    #[gpui::test]
+    fn preview_surfaces_reveal_background_media(cx: &mut TestAppContext) {
+        use gpui::{Context, IntoElement, Render, Window};
+        use theme::ActiveTheme as _;
+        use ui::prelude::*;
+
+        struct PreviewRoot(Entity<MarkdownPreviewView>);
+        impl Render for PreviewRoot {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().flex().flex_col().child(self.0.clone())
+            }
+        }
+
+        init_test(cx);
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("# Heading\n\n```\ncode\n```\n", cx));
+            let editor = cx.new(|cx| Editor::for_buffer(buffer, None, window, cx));
+            let languages = Arc::new(language::LanguageRegistry::new(
+                cx.background_executor().clone(),
+            ));
+            PreviewRoot(MarkdownPreviewView::new(
+                super::MarkdownPreviewMode::Default,
+                editor,
+                gpui::WeakEntity::new_invalid(),
+                languages,
+                window,
+                cx,
+            ))
+        });
+        cx.simulate_resize(gpui::size(px(600.), px(400.)));
+        cx.run_until_parked();
+        for custom_theme in [false, true] {
+            let background = cx.update(|_, cx| {
+                if custom_theme {
+                    let mut theme = cx.theme().as_ref().clone();
+                    theme.name = "Preview Media Test".into();
+                    theme.styles.colors.editor_background = gpui::hsla(0.7, 0.4, 0.2, 1.0);
+                    let background = theme.colors().editor_background;
+                    theme::ThemeRegistry::global(cx).insert_themes([theme]);
+                    cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                        store
+                            .set_user_settings(
+                                r#"{"markdown_preview":{"theme":"Preview Media Test"}}"#,
+                                cx,
+                            )
+                            .expect("Valid preview theme settings");
+                    });
+                    background
+                } else {
+                    cx.theme().colors().editor_background
+                }
+            });
+            for media_enabled in [false, true, false] {
+                root.update(cx, |root, cx| {
+                    root.0.update(cx, |_, cx| cx.notify());
+                });
+                cx.update(|window, cx| {
+                    theme::set_media_background(
+                        window.window_handle().window_id(),
+                        media_enabled,
+                        cx,
+                    );
+                    window.refresh();
+                });
+                cx.run_until_parked();
+                cx.update(|window, _| {
+                    let scale = window.scale_factor();
+                    let opaque_backdrop = window.painted_quads().into_iter().any(|quad| {
+                        quad.background == background.into()
+                            && quad.bounds.size.width.as_f32() >= 590. * scale
+                            && quad.bounds.size.height.as_f32() >= 390. * scale
+                    });
+                    assert_eq!(opaque_backdrop, !media_enabled);
+                    if media_enabled {
+                        assert!(
+                            window
+                                .painted_quads()
+                                .into_iter()
+                                .any(|quad| quad.background == background.opacity(0.35).into()),
+                            "Code block should retain a translucent backdrop"
+                        );
+                    }
+                });
+            }
+        }
+    }
 
     #[test]
     fn filters_matches_in_non_rendered_link_source() {

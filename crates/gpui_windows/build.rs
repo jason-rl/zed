@@ -30,6 +30,7 @@ mod shader_compilation {
 
         // Define all modules
         let modules = [
+            "surface",
             "quad",
             "shadow",
             "path_rasterization",
