@@ -885,7 +885,7 @@ impl Focusable for DiffMultibuffer {
 }
 
 impl Render for DiffMultibuffer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
         let empty_label = self.empty_label.clone();
@@ -893,7 +893,7 @@ impl Render for DiffMultibuffer {
         div()
             .track_focus(&self.focus_handle)
             .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
-            .bg(cx.theme().colors().editor_background)
+            .bg(cx.window_theme(window).colors().editor_background)
             .flex()
             .items_center()
             .justify_center()

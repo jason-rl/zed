@@ -4987,11 +4987,22 @@ impl EditorElement {
     fn paint_background(&self, layout: &EditorLayout, window: &mut Window, cx: &mut App) {
         window.paint_layer(layout.hitbox.bounds, |window| {
             let scroll_top = layout.position_map.scroll_position.y;
-            let gutter_bg = cx.theme().colors().editor_gutter_background;
+            let gutter_bg = cx.window_theme(window).colors().editor_gutter_background;
             window.paint_quad(fill(layout.gutter_hitbox.bounds, gutter_bg));
             window.paint_quad(fill(
                 layout.position_map.text_hitbox.bounds,
-                self.style.background,
+                if matches!(
+                    layout.mode,
+                    EditorMode::Full { .. } | EditorMode::Minimap { .. }
+                ) && (self.style.background == cx.theme().colors().editor_background
+                    || matches!(layout.mode, EditorMode::Minimap { .. })
+                        && self.style.background
+                            == cx.theme().colors().editor_background.opacity(0.7))
+                {
+                    cx.window_theme(window).colors().editor_background
+                } else {
+                    self.style.background
+                },
             ));
 
             if matches!(
@@ -5038,7 +5049,11 @@ impl EditorElement {
                                 CurrentLineHighlight::None => None,
                             };
                         if let Some(range) = highlight_h_range {
-                            let active_line_bg = cx.theme().colors().editor_active_line_background;
+                            let active_line_bg = cx.media_background_color(
+                                window,
+                                cx.theme().colors().editor_active_line_background,
+                                0.3,
+                            );
                             let bounds = Bounds {
                                 origin: point(
                                     range.start,
@@ -5921,7 +5936,11 @@ impl EditorElement {
                     window.paint_quad(quad(
                         hitbox.bounds,
                         Corners::default(),
-                        cx.theme().colors().scrollbar_track_background,
+                        cx.media_background_color(
+                            window,
+                            cx.theme().colors().scrollbar_track_background,
+                            0.25,
+                        ),
                         scrollbar_edges,
                         cx.theme().colors().scrollbar_track_border,
                         BorderStyle::Solid,
@@ -5957,7 +5976,7 @@ impl EditorElement {
                         window.paint_quad(quad(
                             thumb_bounds,
                             Corners::default(),
-                            scrollbar_thumb_color,
+                            cx.media_background_color(window, scrollbar_thumb_color, 0.65),
                             scrollbar_edges,
                             cx.theme().colors().scrollbar_thumb_border,
                             BorderStyle::Solid,

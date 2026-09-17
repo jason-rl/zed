@@ -441,17 +441,17 @@ fn main() {
     );
 
     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
-    if !stdout_is_a_pty() {
-        app.background_executor()
-            .spawn(async {
-                #[cfg(unix)]
-                util::load_login_shell_environment().await.log_err();
-                shell_env_loaded_tx.send(()).ok();
-            })
-            .detach();
+    let shell_environment_loaded = if !stdout_is_a_pty() {
+        app.background_executor().spawn(async {
+            #[cfg(unix)]
+            util::load_login_shell_environment().await.log_err();
+            shell_env_loaded_tx.send(()).ok();
+        })
     } else {
-        drop(shell_env_loaded_tx)
+        drop(shell_env_loaded_tx);
+        Task::ready(())
     }
+    .shared();
 
     app.on_open_urls({
         let open_listener = open_listener.clone();
@@ -477,6 +477,9 @@ fn main() {
     });
 
     app.run(move |cx| {
+        cx.set_global(workspace::BackgroundMediaEnvironment(
+            shell_environment_loaded,
+        ));
         cx.set_global(app_db);
         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
             Ok(trusted_paths) => trusted_paths,

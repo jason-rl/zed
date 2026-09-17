@@ -1388,7 +1388,7 @@ impl Render for CommitView {
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
             .on_action(cx.listener(Self::open_file_at_head_action))
             .size_full()
-            .bg(cx.theme().colors().editor_background)
+            .bg(cx.window_theme(window).colors().editor_background)
             .child(self.render_header(window, cx))
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),

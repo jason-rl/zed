@@ -1406,7 +1406,7 @@ impl Render for TerminalView {
                 div()
                     .id("terminal-view-container")
                     .size_full()
-                    .bg(cx.theme().colors().editor_background)
+                    .bg(cx.window_theme(window).colors().editor_background)
                     .child(TerminalElement::new(
                         terminal_handle,
                         terminal_view_handle,

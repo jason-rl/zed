@@ -101,6 +101,7 @@
 # Customization
 
 - [Appearance](./appearance.md)
+  - [Background Media](./background-media.md)
   - [Themes](./themes.md)
   - [Icon Themes](./icon-themes.md)
   - [Fonts & Visual Tweaks](./visual-customization.md)

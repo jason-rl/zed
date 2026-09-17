@@ -549,7 +549,8 @@ impl SplitBufferHeadersElement {
             latest_selection_anchors,
         );
 
-        let editor_bg_color = cx.theme().colors().editor_background;
+        let editor_background_color =
+            cx.media_background_color(window, cx.theme().colors().editor_background, 0.65);
         let selected = selected_buffer_ids.contains(&excerpt.buffer_id());
 
         let mut header = v_flex()
@@ -562,8 +563,8 @@ impl SplitBufferHeadersElement {
                     .h(FILE_HEADER_HEIGHT as f32 * line_height)
                     .bg(linear_gradient(
                         0.,
-                        linear_color_stop(editor_bg_color.opacity(0.), 0.),
-                        linear_color_stop(editor_bg_color, 0.6),
+                        linear_color_stop(editor_background_color.opacity(0.), 0.),
+                        linear_color_stop(editor_background_color, 0.6),
                     ))
                     .absolute()
                     .top_0(),

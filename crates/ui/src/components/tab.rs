@@ -108,19 +108,19 @@ impl ParentElement for Tab {
 
 impl RenderOnce for Tab {
     #[allow(refining_impl_trait)]
-    fn render(self, _: &mut Window, cx: &mut App) -> Stateful<Div> {
+    fn render(self, window: &mut Window, cx: &mut App) -> Stateful<Div> {
         let (text_color, tab_bg, _tab_hover_bg, _tab_active_bg) = match self.selected {
             false => (
                 cx.theme().colors().text_muted,
-                cx.theme().colors().tab_inactive_background,
-                cx.theme().colors().ghost_element_hover,
-                cx.theme().colors().ghost_element_active,
+                cx.window_theme(window).colors().tab_inactive_background,
+                cx.media_background_color(window, cx.theme().colors().ghost_element_hover, 0.5),
+                cx.media_background_color(window, cx.theme().colors().ghost_element_active, 0.5),
             ),
             true => (
                 cx.theme().colors().text,
-                cx.theme().colors().tab_active_background,
-                cx.theme().colors().element_hover,
-                cx.theme().colors().element_active,
+                cx.window_theme(window).colors().tab_active_background,
+                cx.media_background_color(window, cx.theme().colors().element_hover, 0.5),
+                cx.media_background_color(window, cx.theme().colors().element_active, 0.5),
             ),
         };
 

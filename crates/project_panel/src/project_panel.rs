@@ -646,8 +646,8 @@ struct ItemColors {
     focused: Hsla,
 }
 
-fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
-    let colors = cx.theme().colors();
+fn get_item_color(is_sticky: bool, window: &Window, cx: &App) -> ItemColors {
+    let colors = cx.window_theme(window).colors();
 
     ItemColors {
         default: if is_sticky {
@@ -5950,7 +5950,7 @@ impl ProjectPanel {
         let diagnostic_mark = details.diagnostic_mark;
         let reserves_chevron_slot = details.reserves_chevron_slot;
         let diagnostic_count = details.diagnostic_count;
-        let item_colors = get_item_color(is_sticky, cx);
+        let item_colors = get_item_color(is_sticky, window, cx);
 
         let canonical_path = details.canonical_path.clone();
         let path_style = self.project.read(cx).path_style(cx);
