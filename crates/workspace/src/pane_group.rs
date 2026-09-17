@@ -570,7 +570,7 @@ impl Member {
                     .relative()
                     .size_full()
                     .when(is_maximized, |this| {
-                        this.bg(cx.theme().colors().background)
+                        this.bg(cx.window_theme(window).colors().background)
                             .border_1()
                             .border_color(cx.theme().colors().border)
                             .shadow_lg()

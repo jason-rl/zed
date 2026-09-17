@@ -5521,7 +5521,7 @@ impl AgentPanel {
             VisibleSurface::Uninitialized => Label::new("Agent").truncate().into_any_element(),
         };
 
-        let toolbar_bg = cx.theme().colors().tab_bar_background;
+        let toolbar_bg = cx.window_theme(window).colors().tab_bar_background;
         let gradient_overlay = GradientFade::new(toolbar_bg, toolbar_bg, toolbar_bg)
             .width(px(64.0))
             .right(px(0.0))
@@ -5548,7 +5548,7 @@ impl AgentPanel {
                             .absolute()
                             .right_0()
                             .h_full()
-                            .bg(cx.theme().colors().tab_bar_background)
+                            .bg(cx.window_theme(window).colors().tab_bar_background)
                             .child(
                                 IconButton::new("edit_tile", IconName::Pencil)
                                     .icon_size(IconSize::Small)
@@ -6209,7 +6209,7 @@ impl AgentPanel {
             .h(Tab::container_height(cx))
             .flex_shrink_0()
             .max_w_full()
-            .bg(cx.theme().colors().tab_bar_background)
+            .bg(cx.window_theme(window).colors().tab_bar_background)
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(toolbar_content)
@@ -6511,7 +6511,7 @@ impl Render for AgentPanel {
             .size_full()
             .justify_between()
             .track_focus(&self.focus_handle)
-            .bg(cx.theme().colors().panel_background)
+            .bg(cx.window_theme(window).colors().panel_background)
             .on_action(cx.listener(|this, action: &NewThread, window, cx| {
                 this.new_thread(action, window, cx);
             }))
@@ -6571,7 +6571,7 @@ impl Render for AgentPanel {
                                         .px(DynamicSpacing::Base08.rems(cx))
                                         .border_b_1()
                                         .border_color(cx.theme().colors().border_variant)
-                                        .bg(cx.theme().colors().toolbar_background)
+                                        .bg(cx.window_theme(window).colors().toolbar_background)
                                         .child(search_bar),
                                 )
                             })

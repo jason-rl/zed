@@ -2507,9 +2507,9 @@ checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
 name = "bytemuck"
-version = "1.24.0"
+version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fbdf580320f38b612e485521afda1ee26d10cc9884efaaa750d383e13e3c5f4"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 dependencies = [
  "bytemuck_derive",
 ]
@@ -6291,6 +6291,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd2e7510819d6fbf51a5545c8f922716ecfb14df168a3242f7d33e0239efe6a1"
 
 [[package]]
+name = "fast_image_resize"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9c50201dc184ba6553da1695aac20a042efffbe2d84542cee31917c86c3ab1e"
+dependencies = [
+ "bytemuck",
+ "cfg-if",
+ "document-features",
+ "image",
+ "num-traits",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6970,8 +6984,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -8477,7 +8491,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -10727,6 +10741,30 @@ dependencies = [
  "foreign-types 0.5.0",
  "metal",
  "objc",
+]
+
+[[package]]
+name = "media_background"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fast_image_resize",
+ "futures 0.3.32",
+ "gpui",
+ "gpui_apple",
+ "http_client",
+ "image",
+ "libc",
+ "log",
+ "parking_lot",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
+ "url",
+ "util",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -16475,6 +16513,7 @@ dependencies = [
  "gpui",
  "language_model_core",
  "log",
+ "media_background",
  "schemars 1.0.4",
  "serde",
  "serde_json",
@@ -19053,7 +19092,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fb391ac70462b3097a755618fbf9c8f95ecc1eb379a414f7b46f202ed10db1f"
 dependencies = [
  "cc",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -22239,13 +22278,16 @@ dependencies = [
  "git",
  "gpui",
  "http_client",
+ "image",
  "itertools 0.14.0",
  "language",
  "log",
  "markdown",
+ "media_background",
  "menu",
  "node_runtime",
  "parking_lot",
+ "paths",
  "postage",
  "pretty_assertions",
  "project",
