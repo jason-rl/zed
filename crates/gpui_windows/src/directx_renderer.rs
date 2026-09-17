@@ -84,6 +84,8 @@ struct DirectXResources {
 }
 
 struct DirectXRenderPipelines {
+    surfaces: PipelineState<SurfaceParameters>,
+    video_textures: std::collections::HashMap<u64, [Option<ID3D11ShaderResourceView>; 2]>,
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
@@ -332,6 +334,11 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        self.pipelines.video_textures.retain(|id, _| {
+            scene.surfaces.iter().any(
+                |surface| matches!(&surface.source, SurfaceSource::Nv12(frame) if frame.id == *id),
+            )
+        });
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
@@ -811,6 +818,85 @@ impl DirectXRenderer {
         if surfaces.is_empty() {
             return Ok(());
         }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        for surface in surfaces {
+            let SurfaceSource::Nv12(frame) = &surface.source;
+            let views = match self.pipelines.video_textures.entry(frame.id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let split = frame.width as usize * frame.height as usize;
+                    let mut views = [None, None];
+                    for (plane, view) in views.iter_mut().enumerate() {
+                        let divisor = if plane == 0 { 1 } else { 2 };
+                        let descriptor = D3D11_TEXTURE2D_DESC {
+                            Width: frame.width / divisor,
+                            Height: frame.height / divisor,
+                            MipLevels: 1,
+                            ArraySize: 1,
+                            Format: if plane == 0 {
+                                DXGI_FORMAT_R8_UNORM
+                            } else {
+                                DXGI_FORMAT_R8G8_UNORM
+                            },
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Usage: D3D11_USAGE_IMMUTABLE,
+                            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                            ..Default::default()
+                        };
+                        let data = D3D11_SUBRESOURCE_DATA {
+                            pSysMem: if plane == 0 {
+                                frame.data.as_ptr()
+                            } else {
+                                frame.data[split..].as_ptr()
+                            }
+                            .cast(),
+                            SysMemPitch: frame.width,
+                            SysMemSlicePitch: 0,
+                        };
+                        let mut texture = None;
+                        unsafe {
+                            devices.device.CreateTexture2D(
+                                &descriptor,
+                                Some(&data),
+                                Some(&mut texture),
+                            )?;
+                            devices.device.CreateShaderResourceView(
+                                &texture.context("video texture missing")?,
+                                None,
+                                Some(view),
+                            )?;
+                        }
+                    }
+                    entry.insert(views)
+                }
+            };
+            let parameters = SurfaceParameters {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask,
+                opacity: surface.opacity,
+                padding: [0.0; 3],
+            };
+            let pipeline = &mut self.pipelines.surfaces;
+            pipeline.update_buffer(&devices.device, &devices.device_context, &[parameters])?;
+            set_pipeline_state(
+                &devices.device_context,
+                slice::from_ref(&pipeline.view),
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                &pipeline.vertex,
+                &pipeline.fragment,
+                &pipeline.blend_state,
+            );
+            unsafe {
+                devices.device_context.PSSetShaderResources(2, Some(views));
+                devices
+                    .device_context
+                    .PSSetSamplers(0, Some(slice::from_ref(&self.globals.sampler)));
+                devices.device_context.DrawInstanced(4, 1, 0, 0);
+            }
+        }
         Ok(())
     }
 
@@ -993,6 +1079,14 @@ impl DirectXRenderPipelines {
         )?;
 
         Ok(Self {
+            surfaces: PipelineState::new(
+                device,
+                "video_surface",
+                ShaderModule::Surface,
+                1,
+                create_blend_state(device)?,
+            )?,
+            video_textures: Default::default(),
             shadow_pipeline,
             quad_pipeline,
             path_rasterization_pipeline,
@@ -1078,6 +1172,14 @@ struct BatchParams {
 }
 
 const _: () = assert!(std::mem::size_of::<BatchParams>() == 16);
+
+#[repr(C)]
+struct SurfaceParameters {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    opacity: f32,
+    padding: [f32; 3],
+}
 
 struct PipelineState<T> {
     label: &'static str,
@@ -1702,6 +1804,7 @@ pub(crate) mod shader_resources {
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
+        Surface,
         Quad,
         Shadow,
         Underline,
@@ -1752,6 +1855,10 @@ pub(crate) mod shader_resources {
         #[cfg(not(debug_assertions))]
         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
             let bytes = match module {
+                ShaderModule::Surface => match target {
+                    ShaderTarget::Vertex => SURFACE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SURFACE_FRAGMENT_BYTES,
+                },
                 ShaderModule::Quad => match target {
                     ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
                     ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
@@ -1866,6 +1973,7 @@ pub(crate) mod shader_resources {
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
+                ShaderModule::Surface => "surface",
                 ShaderModule::Quad => "quad",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",

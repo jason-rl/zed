@@ -146,11 +146,69 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
 pub trait ActiveTheme {
     /// Returns the active theme.
     fn theme(&self) -> &Arc<Theme>;
+
+    /// Theme surfaces for a workspace displaying background media.
+    fn window_theme(&self, window: &gpui::Window) -> &Arc<Theme>;
+
+    /// Tints a foreground surface without fading its text or controls.
+    fn media_background_color(&self, window: &gpui::Window, color: Hsla, opacity: f32) -> Hsla {
+        if Arc::ptr_eq(self.window_theme(window), self.theme()) {
+            color
+        } else {
+            color.opacity(opacity)
+        }
+    }
 }
 
 impl ActiveTheme for App {
     fn theme(&self) -> &Arc<Theme> {
         GlobalTheme::theme(self)
+    }
+
+    fn window_theme(&self, window: &gpui::Window) -> &Arc<Theme> {
+        self.try_global::<MediaBackgroundThemes>()
+            .and_then(|themes| themes.0.get(&window.window_handle().window_id()))
+            .unwrap_or_else(|| self.theme())
+    }
+}
+
+#[derive(Default)]
+struct MediaBackgroundThemes(std::collections::HashMap<gpui::WindowId, Arc<Theme>>);
+impl Global for MediaBackgroundThemes {}
+
+/// Enables transparent structural surfaces only in the specified workspace window.
+pub fn set_media_background(window: gpui::WindowId, enabled: bool, cx: &mut App) {
+    if !cx.has_global::<MediaBackgroundThemes>() {
+        cx.set_global(MediaBackgroundThemes::default());
+    }
+    let theme = if enabled {
+        let mut theme = cx.theme().as_ref().clone();
+        let colors = &mut theme.styles.colors;
+        for color in [
+            &mut colors.background,
+            &mut colors.editor_background,
+            &mut colors.editor_gutter_background,
+            &mut colors.terminal_background,
+            &mut colors.panel_background,
+            &mut colors.toolbar_background,
+            &mut colors.status_bar_background,
+            &mut colors.title_bar_background,
+            &mut colors.title_bar_inactive_background,
+            &mut colors.tab_bar_background,
+            &mut colors.tab_active_background,
+            &mut colors.tab_inactive_background,
+        ] {
+            color.a = 0.0;
+        }
+        Some(Arc::new(theme))
+    } else {
+        None
+    };
+    let themes = cx.global_mut::<MediaBackgroundThemes>();
+    if let Some(theme) = theme {
+        themes.0.insert(window, theme);
+    } else {
+        themes.0.remove(&window);
     }
 }
 
@@ -347,5 +405,51 @@ impl GlobalTheme {
     /// Returns the active icon theme.
     pub fn icon_theme(cx: &App) -> &Arc<IconTheme> {
         &cx.global::<Self>().icon_theme
+    }
+}
+
+#[cfg(test)]
+mod media_background_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn media_surfaces_are_window_scoped_and_restore_theme(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init(LoadThemes::JustBase, cx));
+        let media_window = cx.add_window(|_, _| gpui::EmptyView);
+        let normal_window = cx.add_window(|_, _| gpui::EmptyView);
+        media_window
+            .update(cx, |_, window, cx| {
+                let original = cx.theme().clone();
+                let color = gpui::hsla(0.2, 0.5, 0.6, 0.8);
+                assert_eq!(cx.media_background_color(window, color, 0.3), color);
+                set_media_background(window.window_handle().window_id(), true, cx);
+                let translucent = cx.media_background_color(window, color, 0.3);
+                assert_eq!(translucent, color.opacity(0.3));
+                assert_eq!(cx.window_theme(window).colors().editor_background.a, 0.0);
+                assert_eq!(
+                    cx.window_theme(window).colors().text,
+                    original.colors().text
+                );
+                assert_eq!(
+                    cx.window_theme(window).colors().elevated_surface_background,
+                    original.colors().elevated_surface_background
+                );
+                assert_eq!(
+                    cx.window_theme(window).colors().element_background,
+                    original.colors().element_background
+                );
+            })
+            .expect("Media window update");
+        normal_window
+            .update(cx, |_, window, cx| {
+                assert!(Arc::ptr_eq(cx.window_theme(window), cx.theme()));
+            })
+            .expect("Normal window update");
+        media_window
+            .update(cx, |_, window, cx| {
+                set_media_background(window.window_handle().window_id(), false, cx);
+                assert!(Arc::ptr_eq(cx.window_theme(window), cx.theme()));
+            })
+            .expect("Restore window theme");
     }
 }

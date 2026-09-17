@@ -136,6 +136,7 @@ members = [
     "crates/lsp_locations",
     "crates/markdown",
     "crates/markdown_preview",
+    "crates/media_background",
     "crates/media",
     "crates/menu",
     "crates/mermaid_render",
@@ -272,6 +273,8 @@ publish = false
 edition = "2024"
 
 [workspace.dependencies]
+media_background = { path = "crates/media_background" }
+fast_image_resize = { version = "6.0", default-features = false, features = ["std", "image"] }
 
 #
 # Workspace member crates

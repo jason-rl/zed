@@ -126,6 +126,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    video_textures: std::collections::HashMap<u64, (metal::Texture, metal::Texture)>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -345,6 +346,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            video_textures: Default::default(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -493,6 +495,7 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        self.video_textures.retain(|id, _| scene.surfaces.iter().any(|surface| matches!(&surface.source, gpui::SurfaceSource::Nv12(frame) if frame.id == *id)));
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
@@ -1152,35 +1155,89 @@ impl MetalRenderer {
         );
 
         for (index, surface) in surfaces.iter().enumerate() {
+            if let gpui::SurfaceSource::Nv12(frame) = &surface.source {
+                let (y_texture, uv_texture) =
+                    self.video_textures.entry(frame.id).or_insert_with(|| {
+                        let upload = |width, height, format, bytes: &[u8]| {
+                            let descriptor = metal::TextureDescriptor::new();
+                            descriptor.set_texture_type(metal::MTLTextureType::D2);
+                            descriptor.set_width(width);
+                            descriptor.set_height(height);
+                            descriptor.set_pixel_format(format);
+                            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+                            descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+                            let texture = self.device.new_texture(&descriptor);
+                            texture.replace_region(
+                                metal::MTLRegion::new_2d(0, 0, width, height),
+                                0,
+                                bytes.as_ptr().cast(),
+                                frame.width as u64,
+                            );
+                            texture
+                        };
+                        let (luma, chroma) = frame
+                            .data
+                            .split_at(frame.width as usize * frame.height as usize);
+                        (
+                            upload(
+                                frame.width as u64,
+                                frame.height as u64,
+                                MTLPixelFormat::R8Unorm,
+                                luma,
+                            ),
+                            upload(
+                                frame.width as u64 / 2,
+                                frame.height as u64 / 2,
+                                MTLPixelFormat::RG8Unorm,
+                                chroma,
+                            ),
+                        )
+                    });
+                command_encoder
+                    .set_fragment_texture(SurfaceInputIndex::YTexture as u64, Some(y_texture));
+                command_encoder
+                    .set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, Some(uv_texture));
+                command_encoder.draw_primitives_instanced_base_instance(
+                    metal::MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                    (first_surface + index) as u64,
+                );
+                continue;
+            }
+            let gpui::SurfaceSource::Surface(image_buffer) = &surface.source else {
+                continue;
+            };
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(image_buffer.get_width() as i32),
+                DevicePixels::from(image_buffer.get_height() as i32),
             );
 
             assert_eq!(
-                surface.image_buffer.get_pixel_format(),
+                image_buffer.get_pixel_format(),
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             );
 
             let y_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
+                    image_buffer.get_width_of_plane(0),
+                    image_buffer.get_height_of_plane(0),
                     0,
                 )
                 .unwrap();
             let cb_cr_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
+                    image_buffer.get_width_of_plane(1),
+                    image_buffer.get_height_of_plane(1),
                     1,
                 )
                 .unwrap();
@@ -1405,6 +1462,8 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            opacity: surface.opacity,
+            bt709: matches!(surface.source, gpui::SurfaceSource::Nv12(_)) as u32,
         }))?,
     })
 }
@@ -1592,11 +1651,13 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub opacity: f32,
+    pub bt709: u32,
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]

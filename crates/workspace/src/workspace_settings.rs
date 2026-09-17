@@ -13,6 +13,7 @@ use settings::{CommandAliasTarget, SettingsStore};
 
 #[derive(RegisterSetting)]
 pub struct WorkspaceSettings {
+    pub background_media: media_background::Settings,
     pub active_pane_modifiers: ActivePanelModifiers,
     pub bottom_dock_layout: settings::BottomDockLayout,
     pub pane_split_direction_horizontal: settings::PaneSplitDirectionHorizontal,
@@ -97,6 +98,7 @@ impl Settings for WorkspaceSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let workspace = &content.workspace;
         Self {
+            background_media: content.background_media.clone().unwrap_or_default(),
             active_pane_modifiers: ActivePanelModifiers {
                 border_size: Some(
                     *workspace

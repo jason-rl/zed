@@ -4876,6 +4876,11 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+        self.paint_video_surface(bounds, image_buffer.into());
+    }
+
+    /// Paints a video frame, respecting the current clipping and element opacity.
+    pub fn paint_video_surface(&mut self, bounds: Bounds<Pixels>, source: crate::SurfaceSource) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -4886,7 +4891,8 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            source,
+            opacity: self.element_opacity(),
         });
     }
 

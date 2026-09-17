@@ -39,6 +39,7 @@ macro_rules! merge_from_overwrites {
 }
 
 merge_from_overwrites!(
+    media_background::Settings,
     u16,
     u32,
     u64,

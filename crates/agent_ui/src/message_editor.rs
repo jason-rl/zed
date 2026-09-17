@@ -2000,7 +2000,7 @@ impl Focusable for MessageEditor {
 }
 
 impl Render for MessageEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("MessageEditor")
             .on_action(cx.listener(Self::chat))
@@ -2029,7 +2029,11 @@ impl Render for MessageEditor {
                 EditorElement::new(
                     &self.editor,
                     EditorStyle {
-                        background: cx.theme().colors().editor_background,
+                        background: cx.media_background_color(
+                            window,
+                            cx.theme().colors().editor_background,
+                            0.3,
+                        ),
                         local_player: cx.theme().players().local(),
                         text: text_style,
                         syntax: cx.theme().syntax().clone(),

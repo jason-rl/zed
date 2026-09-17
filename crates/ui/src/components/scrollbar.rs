@@ -1459,7 +1459,11 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                         blend_color.min(blend_color.alpha(MAXIMUM_OPACITY))
                     };
 
-                    let mut thumb_color = blending_color.blend(thumb_base_color);
+                    let mut thumb_color = cx.media_background_color(
+                        window,
+                        blending_color.blend(thumb_base_color),
+                        0.65,
+                    );
 
                     if !hovered && let Some(fade) = autohide_fade {
                         thumb_color.fade_out(fade);
@@ -1468,7 +1472,8 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                     if let Some((track_bounds, colors)) = track_config {
                         let has_border = colors.has_border;
 
-                        let mut track_color = colors.background;
+                        let mut track_color =
+                            cx.media_background_color(window, colors.background, 0.25);
                         if let Some(fade) = autohide_fade
                             && !has_border
                         {
